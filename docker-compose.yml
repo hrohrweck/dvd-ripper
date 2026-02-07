@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  dvd-ripper:
+    build: .
+    container_name: dvd-archive
+    privileged: true
+    restart: unless-stopped
+    environment:
+      - INITIAL_SETUP=${INITIAL_SETUP:-false}
+      - SECRET_KEY=${SECRET_KEY}
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - OMDB_API_KEY=${OMDB_API_KEY}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///app/data/dvdrip.db}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+    volumes:
+      - /dev/:/dev
+      - ./storage:/archive
+      - ./config:/app/config
+      - dvd_db:/app/data
+    ports:
+      - "8080:80"
+      - "5555:5555"
+    devices:
+      - /dev/sr0:/dev/sr0
+    cap_add:
+      - SYS_ADMIN
+      - SYS_RAWIO
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: dvd-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+volumes:
+  dvd_db:
+  redis_data:
