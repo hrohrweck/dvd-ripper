@@ -73,17 +73,41 @@ class DVDMonitor:
             mount_point = f"/tmp/dvd_mount_{os.path.basename(self.device_path)}"
             os.makedirs(mount_point, exist_ok=True)
             
-            # Try to mount
+            # Check if already mounted
+            result = subprocess.run(
+                ["mountpoint", "-q", mount_point],
+                capture_output=True
+            )
+            if result.returncode == 0:
+                logger.debug(f"Mount point {mount_point} is already a mountpoint")
+                return mount_point
+            
+            # Try to mount with udf,iso9660 filesystems (common for DVDs)
+            for fs_type in ["udf", "iso9660", "auto"]:
+                result = subprocess.run(
+                    ["mount", "-t", fs_type, self.device_path, mount_point],
+                    capture_output=True,
+                    text=True
+                )
+                
+                if result.returncode == 0:
+                    logger.info(f"Mounted {self.device_path} as {fs_type} at {mount_point}")
+                    return mount_point
+            
+            # Try generic mount as fallback
             result = subprocess.run(
                 ["mount", self.device_path, mount_point],
                 capture_output=True,
                 text=True
             )
             
-            if result.returncode == 0 or "already mounted" in result.stderr:
+            if result.returncode == 0:
+                logger.info(f"Mounted {self.device_path} at {mount_point}")
                 return mount_point
+            else:
+                logger.warning(f"Failed to mount {self.device_path}: {result.stderr}")
+                return None
                 
-            return None
         except Exception as e:
             logger.error(f"Mount failed: {e}")
             return None
@@ -134,21 +158,30 @@ class DVDMonitor:
     def _get_disc_info(self) -> Optional[DiscInfo]:
         """Get information about the current disc."""
         if not self._is_disc_present():
+            logger.debug("No disc present")
             return None
             
         mount_point = self._mount_disc()
         if not mount_point:
+            logger.warning(f"Failed to mount disc at {self.device_path}")
             return None
             
         try:
+            is_dvd = self._is_dvd_video_disc(mount_point)
+            label = self._get_disc_label()
+            logger.info(f"Disc mounted at {mount_point}: label={label}, is_dvd_video={is_dvd}")
+            
             info = DiscInfo(
                 device=self.device_path,
-                label=self._get_disc_label(),
+                label=label,
                 mount_point=mount_point,
-                is_dvd_video=self._is_dvd_video_disc(mount_point),
+                is_dvd_video=is_dvd,
                 volume_size=self._get_disc_size()
             )
             return info
+        except Exception as e:
+            logger.error(f"Error getting disc info: {e}")
+            return None
         finally:
             self._unmount_disc(mount_point)
             
@@ -170,6 +203,22 @@ class DVDMonitor:
         """Start monitoring the DVD drive."""
         self._running = True
         logger.info(f"Starting DVD monitor for {self.device_path}")
+        
+        # Initialize with current status to detect already-inserted discs
+        self._last_status = self._get_drive_status()
+        logger.info(f"Initial drive status: {self._last_status} (CDS_DISC_OK={CDS_DISC_OK})")
+        
+        # Check if disc is already present when monitoring starts
+        if self._last_status == CDS_DISC_OK:
+            logger.info("Disc already present at startup, detecting...")
+            await asyncio.sleep(2)  # Wait for disc to be ready
+            disc_info = self._get_disc_info()
+            if disc_info and disc_info.is_dvd_video:
+                logger.info(f"DVD-Video detected at startup: {disc_info.label}")
+                if self._callback:
+                    await self._trigger_callback(disc_info)
+            elif disc_info:
+                logger.info(f"Non-DVD disc detected at startup: {disc_info.label}")
         
         while self._running:
             try:
