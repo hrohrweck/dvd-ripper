@@ -8,7 +8,7 @@ import yaml
 
 
 class DatabaseConfig(BaseSettings):
-    url: str = Field(default="sqlite:///app/data/dvdrip.db")
+    url: str = Field(default="sqlite:////app/data/dvdrip.db")
 
 
 class FormatConfig(BaseSettings):

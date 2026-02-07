@@ -1,11 +1,13 @@
 """FastAPI application main entry point."""
 import os
+import subprocess
 import asyncio
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
 
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -452,6 +454,110 @@ async def update_config(
     return {"status": "saved"}
 
 
+# SSH Key routes
+
+@app.get("/api/ssh-key/status")
+async def get_ssh_key_status(current_user: str = Depends(require_auth)):
+    """Check if SSH key is uploaded and get its fingerprint."""
+    ssh_key_path = Path("/app/config/ssh_key")
+    
+    if not ssh_key_path.exists():
+        return {"uploaded": False}
+    
+    # Get key fingerprint
+    try:
+        result = subprocess.run(
+            ["ssh-keygen", "-lf", str(ssh_key_path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        # Parse fingerprint from output
+        parts = result.stdout.strip().split()
+        if len(parts) >= 2:
+            return {
+                "uploaded": True,
+                "fingerprint": parts[1],
+                "type": parts[0] if len(parts) > 2 else "unknown"
+            }
+    except:
+        pass
+    
+    return {"uploaded": True, "fingerprint": "unknown"}
+
+
+@app.post("/api/ssh-key/upload")
+async def upload_ssh_key(
+    file: UploadFile = File(...),
+    current_user: str = Depends(require_auth)
+):
+    """Upload an SSH private key."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
+    # Read file content
+    content = await file.read()
+    
+    # Basic validation - check it looks like a private key
+    content_str = content.decode('utf-8', errors='ignore')
+    if 'PRIVATE KEY' not in content_str and 'openssh' not in content_str.lower():
+        raise HTTPException(status_code=400, detail="File does not appear to be a valid SSH private key")
+    
+    # Save key to config directory
+    ssh_key_path = Path("/app/config/ssh_key")
+    
+    try:
+        with open(ssh_key_path, 'wb') as f:
+            f.write(content)
+        
+        # Set secure permissions (owner read/write only)
+        os.chmod(ssh_key_path, 0o600)
+        
+        # Update config to use this key
+        settings = get_settings()
+        if settings.destination.type == "ssh":
+            config_update = {
+                "destination": {
+                    "type": "ssh",
+                    "ssh": {
+                        "key_path": str(ssh_key_path)
+                    }
+                }
+            }
+            update_settings(config_update)
+        
+        return {
+            "status": "uploaded",
+            "message": "SSH key uploaded successfully. Make sure to configure the SSH destination settings."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save SSH key: {str(e)}")
+
+
+@app.delete("/api/ssh-key")
+async def delete_ssh_key(current_user: str = Depends(require_auth)):
+    """Delete the uploaded SSH key."""
+    ssh_key_path = Path("/app/config/ssh_key")
+    
+    if ssh_key_path.exists():
+        ssh_key_path.unlink()
+    
+    # Clear key_path from config
+    settings = get_settings()
+    if settings.destination.type == "ssh":
+        config_update = {
+            "destination": {
+                "type": "ssh",
+                "ssh": {
+                    "key_path": ""
+                }
+            }
+        }
+        update_settings(config_update)
+    
+    return {"status": "deleted"}
+
+
 # Metadata routes
 
 @app.get("/api/metadata/search")
@@ -520,13 +626,25 @@ async def get_drive_status(current_user: str = Depends(require_auth)):
 @app.post("/api/drive/eject")
 async def eject_drive(current_user: str = Depends(require_auth)):
     """Eject DVD drive."""
+    import os
     settings = get_settings()
+    
+    # Check if device exists
+    if not os.path.exists(settings.dvd_device):
+        raise HTTPException(
+            status_code=404, 
+            detail=f"DVD device {settings.dvd_device} not found"
+        )
+    
     ripper = DVDRipper(settings)
     
     if ripper.eject_disc(settings.dvd_device):
         return {"status": "ejected"}
     else:
-        raise HTTPException(status_code=500, detail="Failed to eject drive")
+        raise HTTPException(
+            status_code=500, 
+            detail="Failed to eject drive. Check that the container has proper device permissions (privileged mode, cap_add: SYS_ADMIN)."
+        )
 
 
 # Statistics

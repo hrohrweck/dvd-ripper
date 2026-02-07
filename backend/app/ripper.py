@@ -368,9 +368,51 @@ class DVDRipper:
             
     def eject_disc(self, device: str) -> bool:
         """Eject the disc from drive."""
+        import fcntl
+        
+        # CDROM ioctl constants
+        CDROMEJECT = 0x5309
+        
+        errors = []
+        
+        # Method 1: Try using ioctl (most reliable for DVD drives)
         try:
-            subprocess.run(["eject", device], check=True, capture_output=True)
+            fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                fcntl.ioctl(fd, CDROMEJECT)
+                logger.info(f"Ejected disc using ioctl on {device}")
+                return True
+            finally:
+                os.close(fd)
+        except Exception as e:
+            errors.append(f"ioctl eject: {e}")
+        
+        # Method 2: Try using eject command
+        try:
+            result = subprocess.run(
+                ["eject", device], 
+                check=True, 
+                capture_output=True, 
+                text=True
+            )
+            logger.info(f"Ejected disc using eject command on {device}")
             return True
         except Exception as e:
-            logger.error(f"Eject failed: {e}")
-            return False
+            errors.append(f"eject command: {e}")
+        
+        # Method 3: Try using sg_start (from sg3-utils) as last resort
+        try:
+            result = subprocess.run(
+                ["sg_start", "--eject", device],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logger.info(f"Ejected disc using sg_start on {device}")
+            return True
+        except Exception as e:
+            errors.append(f"sg_start: {e}")
+        
+        # All methods failed
+        logger.error(f"All eject methods failed for {device}: {'; '.join(errors)}")
+        return False

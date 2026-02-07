@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     # Device management
     udev \
     sg3-utils \
+    eject \
     # Python environment
     python3.11 \
     python3-pip \

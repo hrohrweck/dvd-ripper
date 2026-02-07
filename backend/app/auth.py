@@ -15,12 +15,22 @@ ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash."""
+    """Verify password against hash.
+    
+    bcrypt has a 72 byte limit, so we truncate longer passwords.
+    """
+    # bcrypt has a 72 byte limit
+    plain_password = plain_password[:72]
     return pwd_context.verify(plain_password, hashed_password)
 
 
 def get_password_hash(password: str) -> str:
-    """Hash password."""
+    """Hash password.
+    
+    bcrypt has a 72 byte limit, so we truncate longer passwords.
+    """
+    # bcrypt has a 72 byte limit
+    password = password[:72]
     return pwd_context.hash(password)
 
 

@@ -35,7 +35,8 @@ function Dashboard() {
       await api.post('/drive/eject')
       fetchData()
     } catch (err) {
-      alert('Failed to eject drive')
+      const errorMsg = err.response?.data?.detail || 'Failed to eject drive'
+      alert(errorMsg)
     }
   }
 

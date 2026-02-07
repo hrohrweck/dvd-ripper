@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { api } from '../App'
 
 function ConfigPanel() {
@@ -6,9 +6,13 @@ function ConfigPanel() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
+  const [sshKeyStatus, setSshKeyStatus] = useState({ uploaded: false })
+  const [uploadingKey, setUploadingKey] = useState(false)
+  const fileInputRef = useRef(null)
 
   useEffect(() => {
     fetchConfig()
+    fetchSshKeyStatus()
   }, [])
 
   const fetchConfig = async () => {
@@ -19,6 +23,54 @@ function ConfigPanel() {
       console.error('Failed to fetch config:', err)
     } finally {
       setLoading(false)
+    }
+  }
+
+  const fetchSshKeyStatus = async () => {
+    try {
+      const response = await api.get('/ssh-key/status')
+      setSshKeyStatus(response.data)
+    } catch (err) {
+      console.error('Failed to fetch SSH key status:', err)
+    }
+  }
+
+  const handleSshKeyUpload = async (e) => {
+    const file = e.target.files[0]
+    if (!file) return
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    setUploadingKey(true)
+    try {
+      await api.post('/ssh-key/upload', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' }
+      })
+      setMessage('SSH key uploaded successfully')
+      fetchSshKeyStatus()
+      // Also update config to reflect the key path
+      const response = await api.get('/config')
+      setConfig(response.data)
+    } catch (err) {
+      setMessage(err.response?.data?.detail || 'Failed to upload SSH key')
+    } finally {
+      setUploadingKey(false)
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
+    }
+  }
+
+  const handleSshKeyDelete = async () => {
+    if (!confirm('Are you sure you want to remove the SSH key?')) return
+    
+    try {
+      await api.delete('/ssh-key')
+      setMessage('SSH key removed')
+      fetchSshKeyStatus()
+    } catch (err) {
+      setMessage('Failed to remove SSH key')
     }
   }
 
@@ -183,32 +235,97 @@ function ConfigPanel() {
           )}
 
           {config.destination.type === 'ssh' && (
-            <div className="form-row">
-              <div className="form-group">
-                <label>Host</label>
-                <input 
-                  type="text"
-                  value={config.destination.ssh.host}
-                  onChange={(e) => updateNestedConfig('destination', 'ssh', 'host', e.target.value)}
-                />
+            <>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Host</label>
+                  <input 
+                    type="text"
+                    value={config.destination.ssh.host}
+                    onChange={(e) => updateNestedConfig('destination', 'ssh', 'host', e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Username</label>
+                  <input 
+                    type="text"
+                    value={config.destination.ssh.user}
+                    onChange={(e) => updateNestedConfig('destination', 'ssh', 'user', e.target.value)}
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Remote Path</label>
+                  <input 
+                    type="text"
+                    value={config.destination.ssh.remote_path}
+                    onChange={(e) => updateNestedConfig('destination', 'ssh', 'remote_path', e.target.value)}
+                  />
+                </div>
               </div>
-              <div className="form-group">
-                <label>Username</label>
-                <input 
-                  type="text"
-                  value={config.destination.ssh.user}
-                  onChange={(e) => updateNestedConfig('destination', 'ssh', 'user', e.target.value)}
-                />
+
+              {/* SSH Key Upload */}
+              <div className="form-group" style={{ marginTop: 16 }}>
+                <label>SSH Private Key</label>
+                
+                {sshKeyStatus.uploaded ? (
+                  <div style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: 12,
+                    padding: 12,
+                    background: 'var(--success-bg, #d4edda)',
+                    borderRadius: 8,
+                    border: '1px solid var(--success-border, #c3e6cb)'
+                  }}>
+                    <span style={{ fontSize: '1.5rem' }}>🔑</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontWeight: 500 }}>SSH Key Uploaded</div>
+                      <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>
+                        Fingerprint: {sshKeyStatus.fingerprint}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-danger"
+                      style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+                      onClick={handleSshKeyDelete}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: 12 
+                  }}>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".pem,.key,application/x-pem-file,application/x-iwork-keynote-sffkey,text/plain"
+                      onChange={handleSshKeyUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploadingKey}
+                    >
+                      {uploadingKey ? 'Uploading...' : '📁 Select SSH Key File'}
+                    </button>
+                    <span style={{ color: 'var(--text-muted)', fontSize: '0.9rem' }}>
+                      Upload your private key (id_rsa, id_ed25519, etc.)
+                    </span>
+                  </div>
+                )}
+                
+                <small style={{ color: 'var(--text-muted)', display: 'block', marginTop: 8 }}>
+                  The SSH key will be stored securely in the container and used for authentication.
+                  Make sure the corresponding public key is added to the remote server's authorized_keys.
+                </small>
               </div>
-              <div className="form-group">
-                <label>Remote Path</label>
-                <input 
-                  type="text"
-                  value={config.destination.ssh.remote_path}
-                  onChange={(e) => updateNestedConfig('destination', 'ssh', 'remote_path', e.target.value)}
-                />
-              </div>
-            </div>
+            </>
           )}
         </div>
 

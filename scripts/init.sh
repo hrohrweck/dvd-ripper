@@ -19,7 +19,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     # Create default config
     cat > "$CONFIG_FILE" <<'EOF'
 database:
-  url: sqlite:///app/data/dvdrip.db
+  url: sqlite:////app/data/dvdrip.db
 
 formats:
   video_codec: libx265
@@ -64,9 +64,12 @@ fi
 
 # Set permissions for optical drive access
 echo "Setting up optical drive permissions..."
-if [ -e /dev/sr0 ]; then
-    chmod 666 /dev/sr0 2>/dev/null || true
-fi
+for device in /dev/sr* /dev/cdrom*; do
+    if [ -e "$device" ]; then
+        echo "Setting permissions on $device"
+        chmod 666 "$device" 2>/dev/null || true
+    fi
+done
 
 # Setup DVD decryption if needed
 if [ -f /usr/share/doc/libdvdread4/install-css.sh ]; then
