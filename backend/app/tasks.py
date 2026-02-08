@@ -288,7 +288,8 @@ def process_dvd_task(
                 current_step="Initializing..."
             )
             job_id = job.id
-            self.request.kwargs['job_id'] = job_id
+            # Store job_id in request context (not kwargs to avoid retry issues)
+            self.request.job_id = job_id
             
         # Update Celery task ID
         with get_session_context() as session:
@@ -305,9 +306,15 @@ def process_dvd_task(
             
         # Step 2: Find main title
         update_progress(self, job_id, "analyzing", 0, "Analyzing disc structure...")
+        
+        # Wait a moment for the drive to be fully ready
+        import time
+        time.sleep(3)
+        
         main_title = ripper.find_main_title(device_path)
         
         if not main_title:
+            logger.error(f"Could not detect main title on {device_path}")
             raise Exception("Could not detect main title on disc")
             
         # Step 3: Rip

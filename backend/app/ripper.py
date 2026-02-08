@@ -60,25 +60,38 @@ class DVDRipper:
     def get_disc_info(self, device: str) -> Dict:
         """Get information about the disc using makemkvcon."""
         try:
+            # Check if makemkvcon is available
+            result = subprocess.run(["which", "makemkvcon"], capture_output=True)
+            if result.returncode != 0:
+                logger.error("makemkvcon not found in PATH")
+                return {}
+            
+            logger.info(f"Running makemkvcon to get disc info from {device}")
             cmd = ["makemkvcon", "-r", "info", f"dev:{device}"]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=60
+                timeout=120  # Increased timeout for slow drives
             )
             
             if result.returncode != 0:
-                logger.error(f"makemkvcon info failed: {result.stderr}")
+                logger.error(f"makemkvcon info failed with code {result.returncode}")
+                logger.error(f"stderr: {result.stderr}")
+                logger.error(f"stdout: {result.stdout}")
                 return {}
-                
-            return self._parse_makemkv_info(result.stdout)
+            
+            parsed = self._parse_makemkv_info(result.stdout)
+            logger.info(f"Found {len(parsed.get('titles', []))} titles on disc")
+            return parsed
             
         except subprocess.TimeoutExpired:
-            logger.error("Timeout getting disc info")
+            logger.error("Timeout getting disc info (120s exceeded)")
             return {}
         except Exception as e:
             logger.error(f"Error getting disc info: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {}
             
     def _parse_makemkv_info(self, output: str) -> Dict:
