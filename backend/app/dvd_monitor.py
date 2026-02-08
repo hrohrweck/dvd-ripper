@@ -254,6 +254,10 @@ class DVDMonitor:
             disc_info = self._get_disc_info()
             if disc_info and disc_info.is_dvd_video:
                 logger.info(f"DVD-Video detected at startup: {disc_info.label}")
+                # Ensure disc is unmounted before triggering callback
+                # (MakeMKV needs exclusive access)
+                self._unmount_disc(f"/tmp/dvd_mount_{os.path.basename(self.device_path)}")
+                await asyncio.sleep(1)  # Give time for unmount
                 if self._callback:
                     await self._trigger_callback(disc_info)
             elif disc_info:
@@ -369,6 +373,9 @@ class UdevDVDMonitor(DVDMonitor):
                                     
                                     if disc_info and disc_info.is_dvd_video:
                                         logger.info(f"DVD-Video detected via udev: {disc_info.label}")
+                                        # Ensure disc is unmounted before triggering callback
+                                        self._unmount_disc(f"/tmp/dvd_mount_{os.path.basename(self.device_path)}")
+                                        await asyncio.sleep(1)  # Give time for unmount
                                         if self._callback:
                                             await self._trigger_callback(disc_info)
                                     elif disc_info:
