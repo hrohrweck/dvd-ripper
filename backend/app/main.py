@@ -60,12 +60,20 @@ async def lifespan(app: FastAPI):
     
     async def on_disc_inserted(disc_info: DiscInfo):
         """Handle disc insertion."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.info(f"Disc inserted callback triggered: {disc_info}")
         if disc_info.is_dvd_video:
+            logger.info(f"Auto-triggering rip for DVD: {disc_info.label}")
             # Auto-trigger rip if configured (or queue for manual approval)
-            process_dvd_task.delay(
+            task = process_dvd_task.delay(
                 device_path=disc_info.device,
                 disc_label=disc_info.label
             )
+            logger.info(f"Celery task queued: {task.id}")
+        else:
+            logger.info(f"Disc is not DVD-Video, skipping auto-rip")
     
     monitor.on_disc_inserted(on_disc_inserted)
     
@@ -662,6 +670,8 @@ async def get_stats(
     current_user: str = Depends(require_auth)
 ):
     """Get system statistics."""
+    settings = get_settings()
+    
     # Count DVDs
     total_dvds = session.exec(select(DVDEntry)).all()
     total_size = sum(d.file_size for d in total_dvds)
