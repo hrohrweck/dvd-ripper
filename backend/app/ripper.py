@@ -72,7 +72,7 @@ class DVDRipper:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=120  # Increased timeout for slow drives
+                timeout=300  # 5 minute timeout for very slow drives
             )
             
             if result.returncode != 0:
@@ -86,7 +86,7 @@ class DVDRipper:
             return parsed
             
         except subprocess.TimeoutExpired:
-            logger.error("Timeout getting disc info (120s exceeded)")
+            logger.error("Timeout getting disc info (300s exceeded) - drive may be slow or disc damaged")
             return {}
         except Exception as e:
             logger.error(f"Error getting disc info: {e}")

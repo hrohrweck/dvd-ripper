@@ -40,7 +40,8 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
     task_track_started=True,
-    task_time_limit=3600 * 4,  # 4 hours max
+    task_time_limit=3600 * 6,  # 6 hours max for slow drives
+    task_soft_time_limit=3600 * 5,  # Soft limit at 5 hours
     worker_prefetch_multiplier=1,
 )
 
@@ -309,13 +310,18 @@ def process_dvd_task(
         
         # Wait a moment for the drive to be fully ready
         import time
-        time.sleep(3)
+        time.sleep(5)
         
+        logger.info(f"Starting disc analysis on {device_path} - this may take several minutes for slow drives...")
         main_title = ripper.find_main_title(device_path)
         
         if not main_title:
             logger.error(f"Could not detect main title on {device_path}")
-            raise Exception("Could not detect main title on disc")
+            # Check if we should retry or fail
+            if self.request.retries < self.max_retries:
+                logger.info(f"Retrying in 2 minutes (attempt {self.request.retries + 1}/{self.max_retries})")
+                raise self.retry(exc=Exception("Could not detect main title - drive may be slow"), countdown=120)
+            raise Exception("Could not detect main title on disc after all retries")
             
         # Step 3: Rip
         update_progress(self, job_id, "ripping", 0, f"Ripping title {main_title.index}...")
