@@ -53,18 +53,31 @@ class DVDMonitor:
     def _get_drive_status(self) -> int:
         """Get current drive status using ioctl."""
         try:
+            # Check if device exists
+            if not os.path.exists(self.device_path):
+                logger.warning(f"Device {self.device_path} does not exist")
+                return CDS_NO_INFO
+                
             fd = os.open(self.device_path, os.O_RDONLY | os.O_NONBLOCK)
-            status = fcntl.ioctl(fd, CDROM_DRIVE_STATUS, CDSL_CURRENT)
-            os.close(fd)
-            return status
+            try:
+                status = fcntl.ioctl(fd, CDROM_DRIVE_STATUS, CDSL_CURRENT)
+                logger.debug(f"Drive status for {self.device_path}: {status}")
+                return status
+            finally:
+                os.close(fd)
+        except PermissionError as e:
+            logger.error(f"Permission denied accessing {self.device_path}: {e}")
+            return CDS_NO_INFO
         except OSError as e:
-            logger.error(f"Failed to get drive status: {e}")
+            logger.error(f"Failed to get drive status for {self.device_path}: {e}")
             return CDS_NO_INFO
             
     def _is_disc_present(self) -> bool:
         """Check if a disc is present in the drive."""
         status = self._get_drive_status()
-        return status == CDS_DISC_OK
+        is_present = status == CDS_DISC_OK
+        logger.debug(f"Disc present check: status={status}, CDS_DISC_OK={CDS_DISC_OK}, is_present={is_present}")
+        return is_present
         
     def _mount_disc(self) -> Optional[str]:
         """Try to mount the disc and return mount point."""
@@ -155,6 +168,24 @@ class DVDMonitor:
         video_ts = Path(mount_point) / "VIDEO_TS"
         return video_ts.exists() and video_ts.is_dir()
         
+    def _is_dvd_video_by_blkid(self) -> bool:
+        """Check if disc is DVD-Video using blkid (alternative to mounting)."""
+        try:
+            result = subprocess.run(
+                ["blkid", self.device_path],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                # UDF filesystem is commonly used for DVD-Video
+                if "udf" in output:
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"blkid check failed: {e}")
+            return False
+        
     def _get_disc_info(self) -> Optional[DiscInfo]:
         """Get information about the current disc."""
         if not self._is_disc_present():
@@ -162,14 +193,21 @@ class DVDMonitor:
             return None
             
         mount_point = self._mount_disc()
-        if not mount_point:
-            logger.warning(f"Failed to mount disc at {self.device_path}")
-            return None
-            
+        
         try:
-            is_dvd = self._is_dvd_video_disc(mount_point)
+            # Try to detect if it's a DVD-Video disc
+            is_dvd = False
+            if mount_point:
+                is_dvd = self._is_dvd_video_disc(mount_point)
+                logger.debug(f"VIDEO_TS check result: {is_dvd}")
+            
+            # Fallback: use blkid to detect UDF filesystem (DVD-Video uses UDF)
+            if not is_dvd:
+                is_dvd = self._is_dvd_video_by_blkid()
+                logger.debug(f"blkid UDF check result: {is_dvd}")
+                
             label = self._get_disc_label()
-            logger.info(f"Disc mounted at {mount_point}: label={label}, is_dvd_video={is_dvd}")
+            logger.info(f"Disc at {self.device_path}: label={label}, is_dvd_video={is_dvd}")
             
             info = DiscInfo(
                 device=self.device_path,
@@ -183,7 +221,8 @@ class DVDMonitor:
             logger.error(f"Error getting disc info: {e}")
             return None
         finally:
-            self._unmount_disc(mount_point)
+            if mount_point:
+                self._unmount_disc(mount_point)
             
     def _get_disc_size(self) -> int:
         """Get disc size in bytes."""
@@ -279,7 +318,7 @@ class UdevDVDMonitor(DVDMonitor):
         """Start monitoring using udev events with polling fallback."""
         if not self._udev_available:
             logger.warning("pyudev not available, falling back to polling")
-            await super().start_monitoring()
+            await DVDMonitor.start_monitoring(self)
             return
             
         self._running = True
@@ -287,45 +326,65 @@ class UdevDVDMonitor(DVDMonitor):
         
         try:
             import pyudev
+            import select
             context = pyudev.Context()
             
-            # Create monitor
+            # Create monitor and start it
             monitor = pyudev.Monitor.from_netlink(context)
             monitor.filter_by(subsystem='block', device_type='disk')
+            monitor.start()  # Important: start the monitor before using select
+            logger.debug("Udev monitor started successfully")
             
-            # Check initial state
+            # Check initial state - important for already-inserted discs
             self._last_status = self._get_drive_status()
+            logger.info(f"Initial drive status: {self._last_status} (CDS_DISC_OK={CDS_DISC_OK})")
             
-            # Start monitoring in a separate thread
-            loop = asyncio.get_event_loop()
+            # Check if disc is already present when monitoring starts
+            if self._last_status == CDS_DISC_OK:
+                logger.info("Disc already present at startup, detecting...")
+                await asyncio.sleep(2)  # Wait for disc to be ready
+                disc_info = self._get_disc_info()
+                if disc_info and disc_info.is_dvd_video:
+                    logger.info(f"DVD-Video detected at startup: {disc_info.label}")
+                    if self._callback:
+                        await self._trigger_callback(disc_info)
+                elif disc_info:
+                    logger.info(f"Non-DVD disc detected at startup: {disc_info.label}")
             
             while self._running:
-                # Use select for non-blocking monitoring
-                import select
-                
-                if monitor.fileno() >= 0:
-                    ready, _, _ = select.select([monitor], [], [], self.poll_interval)
-                    
-                    if ready:
-                        action, device = monitor.receive()
+                try:
+                    # Use select for non-blocking monitoring
+                    if monitor.fileno() >= 0:
+                        ready, _, _ = select.select([monitor], [], [], self.poll_interval)
                         
-                        if device.device_node == self.device_path:
-                            if action == 'change':
-                                # Disc inserted or removed
-                                await asyncio.sleep(2)  # Wait for mount
-                                disc_info = self._get_disc_info()
-                                
-                                if disc_info and disc_info.is_dvd_video:
-                                    logger.info(f"DVD-Video detected via udev: {disc_info.label}")
-                                    if self._callback:
-                                        await self._trigger_callback(disc_info)
-                                        
-                # Also poll periodically as a fallback
-                await asyncio.sleep(1)
+                        if ready:
+                            action, device = monitor.receive()
+                            
+                            if device.device_node == self.device_path:
+                                logger.debug(f"Udev event: {action} on {device.device_node}")
+                                if action == 'change':
+                                    # Disc inserted or removed
+                                    await asyncio.sleep(2)  # Wait for disc to settle
+                                    disc_info = self._get_disc_info()
+                                    
+                                    if disc_info and disc_info.is_dvd_video:
+                                        logger.info(f"DVD-Video detected via udev: {disc_info.label}")
+                                        if self._callback:
+                                            await self._trigger_callback(disc_info)
+                                    elif disc_info:
+                                        logger.info(f"Non-DVD disc detected via udev: {disc_info.label}")
+                                            
+                    # Also poll periodically as a fallback to catch any missed events
+                    await asyncio.sleep(1)
+                    
+                except Exception as loop_e:
+                    logger.error(f"Error in udev monitoring loop: {loop_e}")
+                    await asyncio.sleep(self.poll_interval)
                 
         except Exception as e:
             logger.error(f"Udev monitor error: {e}, falling back to polling")
-            await super().start_monitoring()
+            # Don't use super() here, call the parent class method directly
+            await DVDMonitor.start_monitoring(self)
 
 
 def create_monitor(device_path: str = "/dev/sr0") -> DVDMonitor:

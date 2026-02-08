@@ -2,10 +2,17 @@
 import os
 import subprocess
 import asyncio
+import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from datetime import datetime
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
