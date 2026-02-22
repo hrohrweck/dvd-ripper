@@ -1,37 +1,47 @@
 """Authentication utilities."""
 from datetime import datetime, timedelta
 from typing import Optional
-from passlib.context import CryptContext
+import bcrypt
 from jose import JWTError, jwt
 from sqlmodel import Session, select
 
 from app.database import User, get_session_context
 from app.config import get_settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify password against hash.
+    """Verify password against hash using bcrypt directly.
     
     bcrypt has a 72 byte limit, so we truncate longer passwords.
     """
     # bcrypt has a 72 byte limit
     plain_password = plain_password[:72]
-    return pwd_context.verify(plain_password, hashed_password)
+    
+    # Ensure we're working with bytes
+    if isinstance(plain_password, str):
+        plain_password = plain_password.encode('utf-8')
+    if isinstance(hashed_password, str):
+        hashed_password = hashed_password.encode('utf-8')
+    
+    return bcrypt.checkpw(plain_password, hashed_password)
 
 
 def get_password_hash(password: str) -> str:
-    """Hash password.
+    """Hash password using bcrypt directly.
     
     bcrypt has a 72 byte limit, so we truncate longer passwords.
     """
     # bcrypt has a 72 byte limit
     password = password[:72]
-    return pwd_context.hash(password)
+    
+    # Ensure we're working with bytes
+    if isinstance(password, str):
+        password = password.encode('utf-8')
+    
+    return bcrypt.hashpw(password, bcrypt.gensalt()).decode('utf-8')
 
 
 def get_user_by_username(session: Session, username: str) -> Optional[User]:

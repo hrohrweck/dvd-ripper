@@ -56,29 +56,112 @@ class DVDRipper:
                 logger.info(f"Cleaned up temp directory: {self.temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to cleanup temp directory: {e}")
+    
+    def _check_tool(self, tool: str) -> bool:
+        """Check if a tool is available."""
+        result = subprocess.run(["which", tool], capture_output=True)
+        return result.returncode == 0
                 
     def get_disc_info(self, device: str) -> Dict:
-        """Get information about the disc using makemkvcon."""
+        """Get information about the disc using lsdvd (reliable) or makemkvcon."""
+        # Try lsdvd first (more reliable with CSS)
+        if self._check_tool("lsdvd"):
+            info = self._get_disc_info_lsdvd(device)
+            if info and info.get("titles"):
+                return info
+        
+        # Fallback to MakeMKV (may hang on some drives)
+        if self._check_tool("makemkvcon"):
+            logger.warning("Using MakeMKV fallback - may hang on some drives")
+            info = self._get_disc_info_makemkv(device)
+            if info and info.get("titles"):
+                return info
+        
+        logger.error("No disc info tool available (lsdvd or makemkvcon)")
+        return {}
+    
+    def _get_disc_info_lsdvd(self, device: str) -> Dict:
+        """Get disc info using lsdvd."""
         try:
-            # Check if makemkvcon is available
-            result = subprocess.run(["which", "makemkvcon"], capture_output=True)
+            logger.info(f"Running lsdvd to get disc info from {device}")
+            cmd = ["lsdvd", "-x", "-Oy", device]
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=60
+            )
+            
             if result.returncode != 0:
-                logger.error("makemkvcon not found in PATH")
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                logger.error(f"lsdvd failed: {stderr}")
                 return {}
             
+            # lsdvd -Oy outputs Python-style dict
+            # Decode with 'replace' to handle non-UTF8 bytes from DVD metadata
+            output = result.stdout.decode('utf-8', errors='replace')
+            return self._parse_lsdvd_output(output)
+            
+        except subprocess.TimeoutExpired:
+            logger.error("Timeout getting disc info with lsdvd")
+            return {}
+        except Exception as e:
+            logger.error(f"Error getting disc info with lsdvd: {e}")
+            return {}
+    
+    def _parse_lsdvd_output(self, output: str) -> Dict:
+        """Parse lsdvd -Oy output into a dict."""
+        info = {"titles": []}
+        
+        try:
+            # lsdvd -Oy outputs: lsdvd = { ... }
+            # Extract the content between outer braces
+            if "lsdvd =" in output:
+                # Parse as Python literal (safe since lsdvd outputs valid Python literals)
+                import ast
+                # Remove 'lsdvd = ' prefix and parse
+                data_str = output.split("lsdvd =", 1)[1].strip()
+                data = ast.literal_eval(data_str)
+                
+                info["disc_name"] = data.get("title", "Unknown")
+                
+                for i, track in enumerate(data.get("track", [])):
+                    # lsdvd provides length as float seconds
+                    length = track.get("length", 0)
+                    if isinstance(length, str):
+                        length = float(length)
+                    title = {
+                        "index": i,
+                        "name": track.get("title", f"Title {i}"),
+                        "duration": length,  # In seconds (float)
+                        "chapters": len(track.get("chapter", [])),
+                        "ix": track.get("ix", 0),  # Title set number
+                        "vts": track.get("vts", 0),  # VTS number
+                        "ttn": track.get("ttn", 0),  # TTN number
+                    }
+                    info["titles"].append(title)
+                
+                logger.info(f"Found {len(info['titles'])} titles using lsdvd")
+                
+        except Exception as e:
+            logger.error(f"Error parsing lsdvd output: {e}")
+            logger.debug(f"lsdvd output: {output[:500]}")
+        
+        return info
+                
+    def _get_disc_info_makemkv(self, device: str) -> Dict:
+        """Get disc info using makemkvcon (fallback, may hang)."""
+        try:
             logger.info(f"Running makemkvcon to get disc info from {device}")
             cmd = ["makemkvcon", "-r", "info", f"dev:{device}"]
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minute timeout for very slow drives
+                timeout=30  # Short timeout since it often hangs
             )
             
             if result.returncode != 0:
                 logger.error(f"makemkvcon info failed with code {result.returncode}")
-                logger.error(f"stderr: {result.stderr}")
-                logger.error(f"stdout: {result.stdout}")
                 return {}
             
             parsed = self._parse_makemkv_info(result.stdout)
@@ -86,12 +169,10 @@ class DVDRipper:
             return parsed
             
         except subprocess.TimeoutExpired:
-            logger.error("Timeout getting disc info (300s exceeded) - drive may be slow or disc damaged")
+            logger.error("Timeout getting disc info with makemkvcon (30s) - drive may be slow or disc damaged")
             return {}
         except Exception as e:
-            logger.error(f"Error getting disc info: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.error(f"Error getting disc info with makemkvcon: {e}")
             return {}
             
     def _parse_makemkv_info(self, output: str) -> Dict:
@@ -137,14 +218,28 @@ class DVDRipper:
         titles = disc_info["titles"]
         if not titles:
             return None
-            
-        # Find longest title
-        main_title = max(titles, key=lambda t: self._parse_size(t.get("size", "0")))
+        
+        # Get duration for each title (handle both string and float)
+        def get_duration(t):
+            dur = t.get("duration", 0)
+            if isinstance(dur, (int, float)):
+                return dur
+            return self._parse_duration(dur)
+        
+        # Filter out titles shorter than 10 minutes (600 seconds)
+        long_titles = [t for t in titles if get_duration(t) > 600]
+        
+        if not long_titles:
+            # If no long titles, take the longest of all
+            long_titles = titles
+        
+        # Find longest title by duration
+        main_title = max(long_titles, key=get_duration)
         
         return TitleInfo(
             index=main_title["index"],
-            duration_seconds=self._parse_duration(main_title.get("duration", "0:00:00")),
-            size_bytes=self._parse_size(main_title.get("size", "0")),
+            duration_seconds=int(get_duration(main_title)),
+            size_bytes=0,  # lsdvd doesn't provide size
             chapters=int(main_title.get("chapters", 0)),
             audio_tracks=[],
             subtitle_tracks=[]
@@ -153,11 +248,17 @@ class DVDRipper:
     def _parse_duration(self, duration_str: str) -> int:
         """Parse duration string to seconds."""
         try:
+            # Handle formats like "01:23:45.123" or "1:23:45"
             parts = duration_str.split(":")
-            if len(parts) == 3:
-                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+            if len(parts) >= 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = float(parts[2])
+                return int(hours * 3600 + minutes * 60 + seconds)
             elif len(parts) == 2:
-                return int(parts[0]) * 60 + int(parts[1])
+                minutes = int(parts[0])
+                seconds = float(parts[1])
+                return int(minutes * 60 + seconds)
         except:
             pass
         return 0
@@ -196,20 +297,174 @@ class DVDRipper:
         output_dir = temp_dir / "rip"
         output_dir.mkdir()
         
+        # Try dvdbackup first (more reliable with CSS)
+        if self._check_tool("dvdbackup"):
+            return self._rip_with_dvdbackup(device, title_index, output_dir, progress_callback)
+        
+        # Fallback to MakeMKV
+        if self._check_tool("makemkvcon"):
+            logger.warning("Using MakeMKV fallback for ripping")
+            return self._rip_with_makemkv(device, title_index, output_dir, progress_callback)
+        
+        return RipResult(success=False, error_message="No ripping tool available (dvdbackup or makemkvcon)")
+    
+    def _rip_with_dvdbackup(
+        self,
+        device: str,
+        title_index: int,
+        output_dir: Path,
+        progress_callback: Optional[callable] = None
+    ) -> RipResult:
+        """Rip using dvdbackup + ffmpeg (reliable with CSS)."""
         try:
-            # Use makemkvcon to rip the title
-            # title_index 0 means auto-select main title
+            # Title index in lsdvd starts from 0, but dvdbackup uses 1-based
+            dvdbackup_title = title_index + 1
+            
+            logger.info(f"Ripping title {title_index} (dvdbackup title {dvdbackup_title}) from {device}")
+            if progress_callback:
+                progress_callback("ripping", 0, "Starting dvdbackup...")
+            
+            # Create a temp directory for dvdbackup output
+            backup_dir = output_dir / "dvd"
+            backup_dir.mkdir()
+            
+            # Run dvdbackup to rip the specific title
+            cmd = [
+                "dvdbackup",
+                "-i", device,
+                "-o", str(backup_dir),
+                "-t", str(dvdbackup_title),  # Specific title
+                "-n", "movie"  # DVD name
+            ]
+            
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+            
+            # Monitor progress (dvdbackup doesn't have percentage, so we just wait)
+            for line in process.stdout:
+                line = line.strip()
+                logger.debug(f"dvdbackup: {line}")
+                if progress_callback:
+                    progress_callback("ripping", 50, line)  # Rough progress
+            
+            process.wait()
+            
+            if process.returncode != 0:
+                return RipResult(
+                    success=False,
+                    error_message=f"dvdbackup failed with code {process.returncode}"
+                )
+            
+            if progress_callback:
+                progress_callback("ripping", 100, "dvdbackup complete")
+            
+            # Find the VIDEO_TS directory
+            video_ts_dirs = list(backup_dir.rglob("VIDEO_TS"))
+            if not video_ts_dirs:
+                return RipResult(
+                    success=False,
+                    error_message="No VIDEO_TS directory found after ripping"
+                )
+            
+            video_ts = video_ts_dirs[0]
+            
+            # Concatenate VOB files and convert to MKV using ffmpeg
+            logger.info(f"Converting VOB files from {video_ts} to MKV")
+            
+            # Find all VOB files for this title
+            vob_files = sorted(video_ts.glob(f"VTS_*{dvdbackup_title:02d}_*.VOB"))
+            if not vob_files:
+                # Try without specific pattern
+                vob_files = sorted(video_ts.glob("*.VOB"))
+            
+            if not vob_files:
+                return RipResult(
+                    success=False,
+                    error_message="No VOB files found"
+                )
+            
+            logger.info(f"Found {len(vob_files)} VOB files")
+            
+            # Create concat file for ffmpeg
+            concat_file = output_dir / "concat.txt"
+            with open(concat_file, "w") as f:
+                for vob in vob_files:
+                    # Escape single quotes in path
+                    path = str(vob).replace("'", "'\\''")
+                    f.write(f"file '{path}'\n")
+            
+            # Convert to MKV using ffmpeg
+            mkv_output = output_dir / "movie.mkv"
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-y",
+                "-f", "concat",
+                "-safe", "0",
+                "-i", str(concat_file),
+                "-c", "copy",  # Copy streams without re-encoding for now
+                "-map", "0:v",
+                "-map", "0:a",
+                str(mkv_output)
+            ]
+            
+            if progress_callback:
+                progress_callback("ripping", 100, "Converting to MKV...")
+            
+            ffmpeg_result = subprocess.run(
+                ffmpeg_cmd,
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+            
+            if ffmpeg_result.returncode != 0:
+                logger.error(f"ffmpeg concat failed: {ffmpeg_result.stderr}")
+                # Fallback: just use the largest VOB file
+                largest_vob = max(vob_files, key=lambda f: f.stat().st_size)
+                return RipResult(success=True, output_path=largest_vob)
+            
+            if mkv_output.exists():
+                return RipResult(success=True, output_path=mkv_output)
+            else:
+                return RipResult(
+                    success=False,
+                    error_message="MKV file was not created"
+                )
+            
+        except subprocess.TimeoutExpired:
+            return RipResult(success=False, error_message="dvdbackup timed out")
+        except Exception as e:
+            logger.error(f"dvdbackup ripping error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return RipResult(success=False, error_message=str(e))
+    
+    def _rip_with_makemkv(
+        self,
+        device: str,
+        title_index: int,
+        output_dir: Path,
+        progress_callback: Optional[callable] = None
+    ) -> RipResult:
+        """Rip using MakeMKV (fallback, may hang)."""
+        try:
             cmd = [
                 "makemkvcon",
-                "--minlength=600",  # Skip titles shorter than 10 minutes
-                "--noscan",  # Don't rescan
+                "--minlength=600",
+                "--noscan",
                 "mkv",
                 f"dev:{device}",
                 str(title_index),
                 str(output_dir)
             ]
             
-            logger.info(f"Ripping title {title_index} from {device}")
+            logger.info(f"Ripping title {title_index} from {device} using MakeMKV")
             
             process = subprocess.Popen(
                 cmd,
@@ -220,12 +475,10 @@ class DVDRipper:
                 universal_newlines=True
             )
             
-            # Monitor progress
             for line in process.stdout:
                 line = line.strip()
                 logger.debug(f"makemkvcon: {line}")
                 
-                # Parse progress
                 if "Progress" in line and progress_callback:
                     try:
                         percent = int(line.split("%")[0].split()[-1])
@@ -233,7 +486,7 @@ class DVDRipper:
                     except:
                         pass
                         
-            process.wait()
+            process.wait(timeout=600)  # 10 minute timeout
             
             if process.returncode != 0:
                 return RipResult(
@@ -241,7 +494,6 @@ class DVDRipper:
                     error_message=f"MakeMKV failed with code {process.returncode}"
                 )
                 
-            # Find the output file
             mkv_files = list(output_dir.glob("*.mkv"))
             if not mkv_files:
                 return RipResult(
@@ -250,15 +502,13 @@ class DVDRipper:
                 )
                 
             output_file = max(mkv_files, key=lambda f: f.stat().st_size)
+            return RipResult(success=True, output_path=output_file)
             
-            return RipResult(
-                success=True,
-                output_path=output_file,
-                title_info=None  # Could populate this if needed
-            )
-            
+        except subprocess.TimeoutExpired:
+            process.kill()
+            return RipResult(success=False, error_message="MakeMKV timed out (10 minutes)")
         except Exception as e:
-            logger.error(f"Ripping error: {e}")
+            logger.error(f"MakeMKV ripping error: {e}")
             return RipResult(success=False, error_message=str(e))
             
     def transcode(
@@ -303,7 +553,6 @@ class DVDRipper:
                 line = line.strip()
                 logger.debug(f"ffmpeg: {line}")
                 
-                # Parse duration from initial output
                 if "Duration:" in line and duration is None:
                     try:
                         time_str = line.split("Duration: ")[1].split(",")[0]
@@ -312,7 +561,6 @@ class DVDRipper:
                     except:
                         pass
                         
-                # Parse progress
                 if "time=" in line and duration and progress_callback:
                     try:
                         time_str = line.split("time=")[1].split()[0]
@@ -353,7 +601,8 @@ class DVDRipper:
             if not main_title:
                 return RipResult(success=False, error_message="Could not find main title")
                 
-            title_idx = main_title.index if main_title else 0
+            title_idx = main_title.index
+            logger.info(f"Selected main title: index={title_idx}, duration={main_title.duration_seconds}s")
             
             # Step 2: Rip
             rip_result = self.rip_title(
@@ -377,6 +626,8 @@ class DVDRipper:
             
         except Exception as e:
             logger.error(f"Processing error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return RipResult(success=False, error_message=str(e))
             
     def eject_disc(self, device: str) -> bool:
