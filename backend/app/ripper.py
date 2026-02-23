@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ import shutil
 import re
 
 from app.config import Settings, get_settings
+from app.job_manager import job_manager, check_job_cancellation
 
 logger = logging.getLogger(__name__)
 
@@ -372,16 +374,21 @@ class DVDRipper:
         self,
         device: str,
         title_index: int = 0,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        job_id: Optional[int] = None
     ) -> RipResult:
         """Rip a specific title from the DVD."""
         temp_dir = self._create_temp_dir()
         output_dir = temp_dir / "rip"
         output_dir.mkdir()
         
+        # Register job with manager if job_id provided
+        if job_id:
+            job_manager.register_job(job_id)
+        
         # Try dvdbackup first (more reliable with CSS)
         if self._check_tool("dvdbackup"):
-            return self._rip_with_dvdbackup(device, title_index, output_dir, progress_callback)
+            return self._rip_with_dvdbackup(device, title_index, output_dir, progress_callback, job_id)
         
         # Fallback to MakeMKV
         if self._check_tool("makemkvcon"):
@@ -395,7 +402,8 @@ class DVDRipper:
         device: str,
         title_index: int,
         output_dir: Path,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        job_id: Optional[int] = None
     ) -> RipResult:
         """Rip using dvdbackup + ffmpeg with proper audio track handling."""
         try:
@@ -427,14 +435,32 @@ class DVDRipper:
                 bufsize=1
             )
             
+            # Register process with job manager if job_id provided
+            if job_id:
+                job_manager.register_process(job_id, process)
+            
             # Monitor progress (dvdbackup doesn't have percentage, so we just wait)
             for line in process.stdout:
                 line = line.strip()
                 logger.debug(f"dvdbackup: {line}")
+                
+                # Check for cancellation
+                if job_id and check_job_cancellation(job_id):
+                    logger.info(f"Job {job_id} cancelled, terminating dvdbackup")
+                    process.terminate()
+                    time.sleep(1)
+                    if process.poll() is None:
+                        process.kill()
+                    return RipResult(success=False, error_message="Job cancelled by user")
+                
                 if progress_callback:
                     progress_callback("ripping", 50, line)  # Rough progress
             
             process.wait()
+            
+            # Check if process was cancelled after completion
+            if job_id and check_job_cancellation(job_id):
+                return RipResult(success=False, error_message="Job cancelled by user")
             
             if process.returncode != 0:
                 return RipResult(
@@ -492,6 +518,10 @@ class DVDRipper:
             for track in audio_tracks:
                 logger.info(f"  Track {track['index']}: {track['language']} ({track['codec']}, {track['channels']}ch) - {track.get('title', '')}")
             
+            # Check for cancellation before starting ffmpeg
+            if job_id and check_job_cancellation(job_id):
+                return RipResult(success=False, error_message="Job cancelled by user")
+            
             # Generate output files - one per audio track
             output_files = []
             
@@ -542,15 +572,42 @@ class DVDRipper:
                 
                 logger.info(f"Creating {mkv_output} with audio track {track_idx} ({lang_code})")
                 
-                ffmpeg_result = subprocess.run(
+                # Run ffmpeg with cancellation support
+                ffmpeg_process = subprocess.Popen(
                     ffmpeg_cmd,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
-                    timeout=600  # 10 minutes per track
+                    bufsize=1
                 )
                 
-                if ffmpeg_result.returncode != 0:
-                    logger.error(f"ffmpeg failed for track {track_idx}: {ffmpeg_result.stderr}")
+                # Register with job manager
+                if job_id:
+                    job_manager.register_process(job_id, ffmpeg_process)
+                
+                # Monitor ffmpeg output
+                for line in ffmpeg_process.stdout:
+                    line = line.strip()
+                    if progress_callback:
+                        progress_callback("transcoding", int((track_idx / len(audio_tracks)) * 100), line)
+                    
+                    # Check for cancellation
+                    if job_id and check_job_cancellation(job_id):
+                        logger.info(f"Job {job_id} cancelled, terminating ffmpeg")
+                        ffmpeg_process.terminate()
+                        time.sleep(1)
+                        if ffmpeg_process.poll() is None:
+                            ffmpeg_process.kill()
+                        return RipResult(success=False, error_message="Job cancelled by user")
+                
+                ffmpeg_process.wait()
+                ffmpeg_returncode = ffmpeg_process.returncode
+                
+                if ffmpeg_returncode != 0:
+                    logger.error(f"ffmpeg failed for track {track_idx}")
+                    # Check if it was cancelled
+                    if job_id and check_job_cancellation(job_id):
+                        return RipResult(success=False, error_message="Job cancelled by user")
                     continue
                 
                 if mkv_output.exists() and mkv_output.stat().st_size > 0:
@@ -732,7 +789,8 @@ class DVDRipper:
         self,
         device: str,
         output_name: str,
-        progress_callback: Optional[callable] = None
+        progress_callback: Optional[callable] = None,
+        job_id: Optional[int] = None
     ) -> RipResult:
         """Full pipeline: rip and transcode."""
         try:
@@ -754,7 +812,8 @@ class DVDRipper:
             rip_result = self.rip_title(
                 device,
                 title_idx,
-                progress_callback
+                progress_callback,
+                job_id
             )
             
             if not rip_result.success:

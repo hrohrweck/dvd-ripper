@@ -38,6 +38,7 @@ from app.metadata.fetcher import MetadataFetcher
 from app.tasks import process_dvd_task, celery_app
 from app.duplicate_checker import duplicate_checker
 from app.log_viewer import log_viewer
+from app.job_manager import job_manager
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token", auto_error=False)
@@ -338,13 +339,14 @@ async def get_jobs(
     """Get rip jobs."""
     statement = select(RipJob).order_by(RipJob.started_at.desc())
     
-    if status:
+    if status and status.lower() != 'all':
         statement = statement.where(RipJob.status == status)
-    else:
+    elif not status:
         # Default: show active jobs
         statement = statement.where(
             RipJob.status.not_in(["completed", "error", "cancelled"])
         )
+    # If status='all', don't filter - show all jobs
     
     jobs = session.exec(statement.limit(50)).all()
     
@@ -431,16 +433,41 @@ async def cancel_job(
     if job.status in ["completed", "error", "cancelled"]:
         raise HTTPException(status_code=400, detail="Job already finished")
     
+    # Use job manager to cancel and terminate processes
+    job_manager.cancel_job(job_id)
+    
     # Revoke Celery task
     if job.celery_task_id:
         celery_app.control.revoke(job.celery_task_id, terminate=True)
     
     job.status = "cancelled"
     job.completed_at = datetime.utcnow()
+    job.error_message = "Cancelled by user"
     session.add(job)
     session.commit()
     
-    return {"status": "cancelled"}
+    return {"status": "cancelled", "message": "Job cancelled successfully"}
+
+
+@app.delete("/api/jobs/{job_id}/delete")
+async def delete_job(
+    job_id: int,
+    session: Session = Depends(get_session),
+    current_user: str = Depends(require_auth)
+):
+    """Permanently delete a job from the database."""
+    job = get_job_by_id(session, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Only allow deletion of finished jobs
+    if job.status not in ["completed", "error", "cancelled"]:
+        raise HTTPException(status_code=400, detail="Cannot delete active job. Cancel it first.")
+    
+    session.delete(job)
+    session.commit()
+    
+    return {"status": "deleted", "message": f"Job {job_id} deleted successfully"}
 
 
 # Configuration routes

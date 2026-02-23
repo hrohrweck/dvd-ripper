@@ -19,6 +19,7 @@ from app.database import (
 from sqlmodel import select
 from app.ripper import DVDRipper
 from app.metadata.fetcher import MetadataFetcher
+from app.job_manager import job_manager, check_job_cancellation
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -329,7 +330,8 @@ def process_dvd_task(
         rip_result = ripper.rip_title(
             device_path,
             main_title.index,
-            progress_callback
+            progress_callback,
+            job_id
         )
         
         if not rip_result.success:
@@ -338,6 +340,13 @@ def process_dvd_task(
         logger.info(f"Ripping complete. Created {len(rip_result.output_paths)} file(s):")
         for path in rip_result.output_paths:
             logger.info(f"  - {path}")
+        
+        # Check for cancellation after rip
+        if check_job_cancellation(job_id):
+            logger.info(f"Job {job_id} cancelled after ripping")
+            ripper.cleanup()
+            job_manager.unregister_job(job_id)
+            raise Ignore()
         
         # Step 4: Transcode
         update_progress(self, job_id, "transcoding", 0, "Starting transcoding...")
@@ -478,6 +487,9 @@ def process_dvd_task(
         # Step 8: Cleanup
         ripper.cleanup()
         
+        # Unregister job from manager
+        job_manager.unregister_job(job_id)
+        
         # Step 9: Eject disc
         ripper.eject_disc(device_path)
         
@@ -512,6 +524,13 @@ def process_dvd_task(
                 ripper.cleanup()
         except:
             pass
+        
+        # Unregister job from manager
+        if job_id:
+            try:
+                job_manager.unregister_job(job_id)
+            except:
+                pass
             
         # Retry logic
         if self.request.retries < self.max_retries:

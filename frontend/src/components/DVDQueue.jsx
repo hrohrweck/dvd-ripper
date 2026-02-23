@@ -33,6 +33,17 @@ function DVDQueue() {
     }
   }
 
+  const handleDelete = async (jobId) => {
+    if (!confirm('Are you sure you want to permanently delete this job?')) return
+    
+    try {
+      await api.delete(`/jobs/${jobId}/delete`)
+      fetchJobs()
+    } catch (err) {
+      alert('Failed to delete job: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
   const getStatusBadge = (status) => {
     const statusMap = {
       'queued': 'info',
@@ -126,13 +137,21 @@ function DVDQueue() {
                   <td>{formatDate(job.started_at)}</td>
                   <td>{formatDuration(job.started_at, job.completed_at)}</td>
                   <td>
-                    {!['completed', 'error', 'cancelled'].includes(job.status) && (
+                    {!['completed', 'error', 'cancelled'].includes(job.status) ? (
                       <button 
                         className="btn btn-danger"
                         style={{ padding: '6px 12px', fontSize: '0.85rem' }}
                         onClick={() => handleCancel(job.id)}
                       >
                         Cancel
+                      </button>
+                    ) : (
+                      <button 
+                        className="btn btn-secondary"
+                        style={{ padding: '6px 12px', fontSize: '0.85rem' }}
+                        onClick={() => handleDelete(job.id)}
+                      >
+                        Delete
                       </button>
                     )}
                   </td>
