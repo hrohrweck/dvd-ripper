@@ -36,6 +36,8 @@ from app.ripper import DVDRipper
 from app.dvd_monitor import create_monitor, DiscInfo
 from app.metadata.fetcher import MetadataFetcher
 from app.tasks import process_dvd_task, celery_app
+from app.duplicate_checker import duplicate_checker
+from app.log_viewer import log_viewer
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token", auto_error=False)
@@ -65,6 +67,25 @@ async def lifespan(app: FastAPI):
         
         logger.info(f"Disc inserted callback triggered: {disc_info}")
         if disc_info.is_dvd_video:
+            # Check for duplicate before ripping
+            logger.info(f"Checking for duplicate: {disc_info.label}")
+            duplicate_check = duplicate_checker.check_disc_in_library(
+                disc_label=disc_info.label,
+                disc_size=disc_info.volume_size
+            )
+            
+            if duplicate_check["is_duplicate"]:
+                logger.warning(f"DUPLICATE DVD DETECTED: {disc_info.label}")
+                logger.warning(f"Skipping auto-rip: {duplicate_check['message']}")
+                # Log the duplicate detection
+                duplicate_checker.log_duplicate_detection(
+                    disc_info.label, 
+                    is_duplicate=True, 
+                    message=duplicate_check["message"]
+                )
+                return
+            
+            logger.info(f"NEW DVD DETECTED: {disc_info.label}")
             logger.info(f"Auto-triggering rip for DVD: {disc_info.label}")
             # Auto-trigger rip if configured (or queue for manual approval)
             task = process_dvd_task.delay(
@@ -693,6 +714,70 @@ async def get_stats(
             "destination": settings.destination.type,
             "path": settings.destination.local.path if settings.destination.type == "local" else settings.destination.ssh.remote_path
         }
+    }
+
+
+# Log Viewer Routes
+
+@app.get("/api/logs")
+async def get_logs(
+    current_user: str = Depends(require_auth)
+):
+    """Get list of available log files."""
+    logs = log_viewer.get_available_logs()
+    return {"logs": logs}
+
+
+@app.get("/api/logs/{log_name}")
+async def get_log_content(
+    log_name: str,
+    lines: int = 100,
+    search: Optional[str] = None,
+    current_user: str = Depends(require_auth)
+):
+    """Get content of a specific log file."""
+    result = log_viewer.get_log_content(log_name, lines, search)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/api/logs/service/{service_name}")
+async def get_service_logs(
+    service_name: str,
+    current_user: str = Depends(require_auth)
+):
+    """Get logs for a specific service."""
+    logs = log_viewer.get_logs_by_service(service_name)
+    return {"service": service_name, "logs": logs}
+
+
+# Duplicate Check Route
+
+@app.post("/api/check-duplicate")
+async def check_duplicate(
+    disc_label: Optional[str] = None,
+    disc_size: int = 0,
+    current_user: str = Depends(require_auth)
+):
+    """Check if a DVD is already in the library."""
+    result = duplicate_checker.check_disc_in_library(disc_label, disc_size)
+    
+    # Convert DVDEntry objects to dict for JSON response
+    entries = []
+    for entry in result["matching_entries"]:
+        entries.append({
+            "id": entry.id,
+            "title": entry.title,
+            "year": entry.year,
+            "file_path": entry.file_path,
+            "created_at": entry.created_at.isoformat() if entry.created_at else None
+        })
+    
+    return {
+        "is_duplicate": result["is_duplicate"],
+        "message": result["message"],
+        "matching_entries": entries
     }
 
 

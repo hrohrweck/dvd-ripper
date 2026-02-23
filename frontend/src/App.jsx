@@ -10,6 +10,7 @@ import DVDQueue from './components/DVDQueue'
 import ConfigPanel from './components/ConfigPanel'
 import Login from './components/Login'
 import Setup from './components/Setup'
+import LogViewer from './components/LogViewer'
 
 // API instance
 export const api = axios.create({
@@ -101,6 +102,7 @@ function App() {
                 <li><Link to="/">Dashboard</Link></li>
                 <li><Link to="/library">Library</Link></li>
                 <li><Link to="/queue">Queue</Link></li>
+                <li><Link to="/logs">Logs</Link></li>
                 <li><Link to="/config">Settings</Link></li>
               </ul>
               <button className="logout-btn" onClick={logout}>Logout</button>
@@ -110,6 +112,7 @@ function App() {
                 <Route path="/" element={<Dashboard />} />
                 <Route path="/library" element={<Library />} />
                 <Route path="/queue" element={<DVDQueue />} />
+                <Route path="/logs" element={<LogViewer />} />
                 <Route path="/config" element={<ConfigPanel />} />
               </Routes>
             </main>

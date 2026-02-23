@@ -6,12 +6,25 @@ import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import shutil
+import re
 
 from app.config import Settings, get_settings
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AudioTrack:
+    """Information about an audio track."""
+    index: int
+    codec: str
+    language: str
+    channels: int
+    stream_index: int
+    is_main: bool = False
+    title: str = ""
 
 
 @dataclass
@@ -21,15 +34,15 @@ class TitleInfo:
     duration_seconds: int
     size_bytes: int
     chapters: int
-    audio_tracks: List[Dict]
-    subtitle_tracks: List[Dict]
+    audio_tracks: List[AudioTrack] = field(default_factory=list)
+    subtitle_tracks: List[Dict] = field(default_factory=list)
 
 
 @dataclass
 class RipResult:
     """Result of ripping operation."""
     success: bool
-    output_path: Optional[Path] = None
+    output_paths: List[Path] = field(default_factory=list)
     error_message: Optional[str] = None
     title_info: Optional[TitleInfo] = None
 
@@ -129,6 +142,18 @@ class DVDRipper:
                     length = track.get("length", 0)
                     if isinstance(length, str):
                         length = float(length)
+                    
+                    # Parse audio tracks
+                    audio_tracks = []
+                    for j, audio in enumerate(track.get("audio", [])):
+                        audio_tracks.append({
+                            "index": j,
+                            "langcode": audio.get("langcode", "unknown"),
+                            "language": audio.get("language", f"Track {j+1}"),
+                            "format": audio.get("format", "unknown"),
+                            "channels": audio.get("channels", 2),
+                        })
+                    
                     title = {
                         "index": i,
                         "name": track.get("title", f"Title {i}"),
@@ -137,6 +162,7 @@ class DVDRipper:
                         "ix": track.get("ix", 0),  # Title set number
                         "vts": track.get("vts", 0),  # VTS number
                         "ttn": track.get("ttn", 0),  # TTN number
+                        "audio": audio_tracks,
                     }
                     info["titles"].append(title)
                 
@@ -236,12 +262,24 @@ class DVDRipper:
         # Find longest title by duration
         main_title = max(long_titles, key=get_duration)
         
+        # Convert audio tracks
+        audio_tracks = []
+        for i, audio in enumerate(main_title.get("audio", [])):
+            audio_tracks.append(AudioTrack(
+                index=i,
+                codec=audio.get("format", "AC3"),
+                language=audio.get("langcode", audio.get("language", f"track{i}")),
+                channels=audio.get("channels", 2),
+                stream_index=i,
+                title=audio.get("language", f"Track {i+1}")
+            ))
+        
         return TitleInfo(
             index=main_title["index"],
             duration_seconds=int(get_duration(main_title)),
             size_bytes=0,  # lsdvd doesn't provide size
             chapters=int(main_title.get("chapters", 0)),
-            audio_tracks=[],
+            audio_tracks=audio_tracks,
             subtitle_tracks=[]
         )
         
@@ -285,6 +323,50 @@ class DVDRipper:
         except:
             pass
         return 0
+    
+    def _probe_audio_tracks(self, vob_files: List[Path]) -> List[Dict]:
+        """Use ffprobe to detect all audio tracks in VOB files."""
+        if not vob_files:
+            return []
+        
+        # Use the first VOB file for probing
+        first_vob = vob_files[0]
+        
+        try:
+            cmd = [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "stream=index,codec_name,codec_type,channels:stream_tags=language,title",
+                "-of", "json",
+                str(first_vob)
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                logger.error(f"ffprobe failed: {result.stderr}")
+                return []
+            
+            probe_data = json.loads(result.stdout)
+            audio_tracks = []
+            
+            for stream in probe_data.get("streams", []):
+                if stream.get("codec_type") == "audio":
+                    tags = stream.get("tags", {})
+                    audio_tracks.append({
+                        "index": stream.get("index"),
+                        "codec": stream.get("codec_name", "unknown"),
+                        "channels": stream.get("channels", 2),
+                        "language": tags.get("language", "und"),
+                        "title": tags.get("title", ""),
+                    })
+            
+            logger.info(f"Detected {len(audio_tracks)} audio tracks: {[a['language'] for a in audio_tracks]}")
+            return audio_tracks
+            
+        except Exception as e:
+            logger.error(f"Error probing audio tracks: {e}")
+            return []
         
     def rip_title(
         self,
@@ -315,7 +397,7 @@ class DVDRipper:
         output_dir: Path,
         progress_callback: Optional[callable] = None
     ) -> RipResult:
-        """Rip using dvdbackup + ffmpeg (reliable with CSS)."""
+        """Rip using dvdbackup + ffmpeg with proper audio track handling."""
         try:
             # Title index in lsdvd starts from 0, but dvdbackup uses 1-based
             dvdbackup_title = title_index + 1
@@ -373,9 +455,6 @@ class DVDRipper:
             
             video_ts = video_ts_dirs[0]
             
-            # Concatenate VOB files and convert to MKV using ffmpeg
-            logger.info(f"Converting VOB files from {video_ts} to MKV")
-            
             # Find all VOB files for this title
             vob_files = sorted(video_ts.glob(f"VTS_*{dvdbackup_title:02d}_*.VOB"))
             if not vob_files:
@@ -398,47 +477,99 @@ class DVDRipper:
                     path = str(vob).replace("'", "'\\''")
                     f.write(f"file '{path}'\n")
             
-            # Convert to MKV using ffmpeg
-            mkv_output = output_dir / "movie.mkv"
-            ffmpeg_cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(concat_file),
-                "-c", "copy",  # Copy streams without re-encoding for now
-                "-map", "0:v",
-                "-map", "0:a",
-                str(mkv_output)
-            ]
-            
+            # Probe audio tracks from VOB files
             if progress_callback:
-                progress_callback("ripping", 100, "Converting to MKV...")
+                progress_callback("analyzing", 0, "Detecting audio tracks...")
             
-            ffmpeg_result = subprocess.run(
-                ffmpeg_cmd,
-                capture_output=True,
-                text=True,
-                timeout=300
-            )
+            audio_tracks = self._probe_audio_tracks(vob_files)
             
-            if ffmpeg_result.returncode != 0:
-                logger.error(f"ffmpeg concat failed: {ffmpeg_result.stderr}")
-                # Fallback: just use the largest VOB file
-                largest_vob = max(vob_files, key=lambda f: f.stat().st_size)
-                return RipResult(success=True, output_path=largest_vob)
+            if not audio_tracks:
+                logger.warning("No audio tracks detected, falling back to default behavior")
+                audio_tracks = [{"index": 1, "codec": "ac3", "language": "eng", "channels": 2, "title": ""}]
             
-            if mkv_output.exists():
-                return RipResult(success=True, output_path=mkv_output)
-            else:
+            # Log detected audio tracks
+            logger.info(f"Detected {len(audio_tracks)} audio track(s):")
+            for track in audio_tracks:
+                logger.info(f"  Track {track['index']}: {track['language']} ({track['codec']}, {track['channels']}ch) - {track.get('title', '')}")
+            
+            # Generate output files - one per audio track
+            output_files = []
+            
+            for track_idx, audio_track in enumerate(audio_tracks):
+                # Determine language code
+                lang_code = audio_track.get('language', 'und')
+                if lang_code == 'und' or not lang_code:
+                    lang_code = f'track{track_idx+1}'
+                
+                # Create output filename with language code
+                mkv_output = output_dir / f"movie_{lang_code}.mkv"
+                
+                if progress_callback:
+                    progress_callback("transcoding", int((track_idx / len(audio_tracks)) * 100), 
+                                    f"Converting audio track {track_idx+1}/{len(audio_tracks)} ({lang_code})...")
+                
+                # Build ffmpeg command for this audio track
+                # Map video and the specific audio track
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", str(concat_file),
+                ]
+                
+                # Map video stream
+                ffmpeg_cmd.extend(["-map", "0:v:0"])
+                
+                # Map specific audio stream
+                audio_stream_idx = audio_track['index']
+                ffmpeg_cmd.extend(["-map", f"0:a:{track_idx}"])
+                
+                # Audio codec settings - copy for original quality
+                ffmpeg_cmd.extend([
+                    "-c:v", "copy",  # Copy video as-is
+                    "-c:a", "copy",  # Copy audio as-is to preserve quality
+                ])
+                
+                # Add metadata
+                ffmpeg_cmd.extend([
+                    "-metadata:s:a:0", f"language={lang_code}",
+                    "-metadata:s:a:0", f"title={audio_track.get('title', lang_code)}",
+                ])
+                
+                ffmpeg_cmd.append(str(mkv_output))
+                
+                logger.info(f"Creating {mkv_output} with audio track {track_idx} ({lang_code})")
+                
+                ffmpeg_result = subprocess.run(
+                    ffmpeg_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minutes per track
+                )
+                
+                if ffmpeg_result.returncode != 0:
+                    logger.error(f"ffmpeg failed for track {track_idx}: {ffmpeg_result.stderr}")
+                    continue
+                
+                if mkv_output.exists() and mkv_output.stat().st_size > 0:
+                    output_files.append(mkv_output)
+                    logger.info(f"Created {mkv_output} ({mkv_output.stat().st_size // 1024 // 1024} MB)")
+                else:
+                    logger.error(f"Output file {mkv_output} was not created or is empty")
+            
+            if not output_files:
                 return RipResult(
                     success=False,
-                    error_message="MKV file was not created"
+                    error_message="No output files were created"
                 )
             
+            logger.info(f"Successfully created {len(output_files)} output file(s)")
+            return RipResult(success=True, output_paths=output_files)
+            
         except subprocess.TimeoutExpired:
-            return RipResult(success=False, error_message="dvdbackup timed out")
+            return RipResult(success=False, error_message="dvdbackup or ffmpeg timed out")
         except Exception as e:
             logger.error(f"dvdbackup ripping error: {e}")
             import traceback
@@ -502,7 +633,7 @@ class DVDRipper:
                 )
                 
             output_file = max(mkv_files, key=lambda f: f.stat().st_size)
-            return RipResult(success=True, output_path=output_file)
+            return RipResult(success=True, output_paths=[output_file])
             
         except subprocess.TimeoutExpired:
             process.kill()
@@ -510,80 +641,92 @@ class DVDRipper:
         except Exception as e:
             logger.error(f"MakeMKV ripping error: {e}")
             return RipResult(success=False, error_message=str(e))
-            
+    
     def transcode(
         self,
-        input_path: Path,
-        output_path: Path,
+        input_paths: List[Path],
+        output_name: str,
         progress_callback: Optional[callable] = None
     ) -> RipResult:
-        """Transcode the ripped file to final format."""
+        """Transcode the ripped files to final format."""
         config = self.settings.formats
+        output_files = []
         
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-y",
-            "-i", str(input_path),
-            "-c:v", config.video_codec,
-            "-preset", config.preset,
-            "-crf", str(config.crf),
-            "-c:a", config.audio_codec,
-            "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-stats",
-            str(output_path)
-        ]
-        
-        logger.info(f"Transcoding {input_path} -> {output_path}")
-        
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
+        for idx, input_path in enumerate(input_paths):
+            # Extract language from filename (movie_LANG.mkv)
+            lang_match = re.search(r'movie_([a-zA-Z0-9]+)\.mkv$', input_path.name)
+            lang_suffix = lang_match.group(1) if lang_match else f"track{idx+1}"
             
-            duration = None
+            output_path = self.temp_dir / f"{output_name}_{lang_suffix}.{config.container}"
             
-            for line in process.stdout:
-                line = line.strip()
-                logger.debug(f"ffmpeg: {line}")
-                
-                if "Duration:" in line and duration is None:
-                    try:
-                        time_str = line.split("Duration: ")[1].split(",")[0]
-                        h, m, s = time_str.split(":")
-                        duration = int(h) * 3600 + int(m) * 60 + float(s)
-                    except:
-                        pass
-                        
-                if "time=" in line and duration and progress_callback:
-                    try:
-                        time_str = line.split("time=")[1].split()[0]
-                        h, m, s = time_str.split(":")
-                        current = int(h) * 3600 + int(m) * 60 + float(s)
-                        percent = int((current / duration) * 100)
-                        progress_callback("transcoding", percent, line)
-                    except:
-                        pass
-                        
-            process.wait()
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-y",
+                "-i", str(input_path),
+                "-c:v", config.video_codec,
+                "-preset", config.preset,
+                "-crf", str(config.crf),
+                "-c:a", config.audio_codec,
+                "-b:a", "192k",
+                "-movflags", "+faststart",
+                "-stats",
+                str(output_path)
+            ]
             
-            if process.returncode != 0:
-                return RipResult(
-                    success=False,
-                    error_message=f"FFmpeg failed with code {process.returncode}"
+            logger.info(f"Transcoding {input_path} ({lang_suffix}) -> {output_path}")
+            
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
                 )
                 
-            return RipResult(success=True, output_path=output_path)
+                duration = None
+                
+                for line in process.stdout:
+                    line = line.strip()
+                    logger.debug(f"ffmpeg: {line}")
+                    
+                    if "Duration:" in line and duration is None:
+                        try:
+                            time_str = line.split("Duration: ")[1].split(",")[0]
+                            h, m, s = time_str.split(":")
+                            duration = int(h) * 3600 + int(m) * 60 + float(s)
+                        except:
+                            pass
+                            
+                    if "time=" in line and duration and progress_callback:
+                        try:
+                            time_str = line.split("time=")[1].split()[0]
+                            h, m, s = time_str.split(":")
+                            current = int(h) * 3600 + int(m) * 60 + float(s)
+                            percent = int((current / duration) * 100)
+                            progress_callback("transcoding", percent, line)
+                        except:
+                            pass
+                            
+                process.wait()
+                
+                if process.returncode != 0:
+                    logger.error(f"FFmpeg failed for {lang_suffix}")
+                    continue
+                    
+                output_files.append(output_path)
+                logger.info(f"Transcoded {lang_suffix}: {output_path}")
+                
+            except Exception as e:
+                logger.error(f"Transcoding error for {input_path}: {e}")
+                continue
+        
+        if not output_files:
+            return RipResult(success=False, error_message="All transcoding operations failed")
             
-        except Exception as e:
-            logger.error(f"Transcoding error: {e}")
-            return RipResult(success=False, error_message=str(e))
+        return RipResult(success=True, output_paths=output_files)
             
     def process_dvd(
         self,
@@ -603,6 +746,9 @@ class DVDRipper:
                 
             title_idx = main_title.index
             logger.info(f"Selected main title: index={title_idx}, duration={main_title.duration_seconds}s")
+            logger.info(f"Audio tracks available: {len(main_title.audio_tracks)}")
+            for track in main_title.audio_tracks:
+                logger.info(f"  - {track.language} ({track.codec})")
             
             # Step 2: Rip
             rip_result = self.rip_title(
@@ -613,12 +759,15 @@ class DVDRipper:
             
             if not rip_result.success:
                 return rip_result
+            
+            logger.info(f"Rip complete. Created {len(rip_result.output_paths)} file(s):")
+            for path in rip_result.output_paths:
+                logger.info(f"  - {path}")
                 
-            # Step 3: Transcode
-            output_path = self.temp_dir / f"{output_name}.{self.settings.formats.container}"
+            # Step 3: Transcode each file
             transcode_result = self.transcode(
-                rip_result.output_path,
-                output_path,
+                rip_result.output_paths,
+                output_name,
                 progress_callback
             )
             

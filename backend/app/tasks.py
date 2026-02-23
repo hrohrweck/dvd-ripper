@@ -335,26 +335,28 @@ def process_dvd_task(
         if not rip_result.success:
             raise Exception(f"Ripping failed: {rip_result.error_message}")
             
-        ripped_file = rip_result.output_path
+        logger.info(f"Ripping complete. Created {len(rip_result.output_paths)} file(s):")
+        for path in rip_result.output_paths:
+            logger.info(f"  - {path}")
         
         # Step 4: Transcode
         update_progress(self, job_id, "transcoding", 0, "Starting transcoding...")
         
         output_name = disc_label or "movie"
-        output_path = ripper.temp_dir / f"{output_name}.{settings.formats.container}"
         
         transcode_result = ripper.transcode(
-            ripped_file,
-            output_path,
+            rip_result.output_paths,
+            output_name,
             progress_callback
         )
         
         if not transcode_result.success:
             raise Exception(f"Transcoding failed: {transcode_result.error_message}")
-            
-        temp_output = transcode_result.output_path
-        file_size = temp_output.stat().st_size
         
+        logger.info(f"Transcoding complete. Created {len(transcode_result.output_paths)} file(s)")
+        for path in transcode_result.output_paths:
+            logger.info(f"  - {path}")
+            
         # Step 5: Metadata
         metadata = manual_metadata or {}
         
@@ -392,41 +394,74 @@ def process_dvd_task(
         if not metadata.get('title'):
             metadata['title'] = disc_label or "Unknown Movie"
             
-        # Step 6: Archive
-        update_progress(self, job_id, "archiving", 50, "Moving to archive...")
+        # Step 6: Archive all files
+        update_progress(self, job_id, "archiving", 50, f"Moving {len(transcode_result.output_paths)} file(s) to archive...")
         
-        final_path = save_to_archive(temp_output, metadata, settings)
+        final_paths = []
+        total_size = 0
         
-        update_progress(self, job_id, "archiving", 100, f"Saved to {final_path}")
-        
-        # Step 7: Create library entry
-        with get_session_context() as session:
-            dvd = create_dvd_entry(
-                session,
-                title=metadata.get('title', 'Unknown'),
-                original_title=metadata.get('original_title'),
-                year=int(metadata['year']) if metadata.get('year') and str(metadata['year']).isdigit() else None,
-                plot=metadata.get('plot'),
-                poster_url=metadata.get('poster_url'),
-                backdrop_url=metadata.get('backdrop_url'),
-                genre=', '.join(metadata['genres']) if isinstance(metadata.get('genres'), list) else metadata.get('genre'),
-                director=metadata.get('director'),
-                cast=', '.join(metadata['cast']) if isinstance(metadata.get('cast'), list) else metadata.get('cast'),
-                runtime=metadata.get('runtime'),
-                imdb_id=metadata.get('imdb_id'),
-                tmdb_id=int(metadata['tmdb_id']) if metadata.get('tmdb_id') and str(metadata['tmdb_id']).isdigit() else None,
-                file_path=str(final_path),
-                file_size=file_size,
-                file_format=settings.formats.container,
-                video_codec=settings.formats.video_codec,
-                audio_codec=settings.formats.audio_codec,
-                status='completed',
-                resolution=None  # Could detect this
-            )
+        for idx, temp_output in enumerate(transcode_result.output_paths):
+            # Add language info to metadata for each file
+            file_metadata = metadata.copy()
             
-            # Update job with DVD entry reference
+            # Extract language from filename (e.g., movie_eng.mp4)
+            lang_match = None
+            if '_' in temp_output.stem:
+                parts = temp_output.stem.rsplit('_', 1)
+                if len(parts) == 2:
+                    lang_match = parts[1]
+            
+            if lang_match:
+                file_metadata['audio_language'] = lang_match
+                file_metadata['title'] = f"{metadata.get('title', 'Unknown')} ({lang_match})"
+            
+            final_path = save_to_archive(temp_output, file_metadata, settings)
+            final_paths.append(str(final_path))
+            total_size += Path(final_path).stat().st_size
+            
+            logger.info(f"Archived: {final_path}")
+        
+        update_progress(self, job_id, "archiving", 100, f"Saved {len(final_paths)} file(s) to archive")
+        
+        # Step 7: Create library entries (one per language)
+        dvd_entries = []
+        with get_session_context() as session:
+            for idx, final_path in enumerate(final_paths):
+                # Extract language from filename
+                lang_suffix = ""
+                if '_' in Path(final_path).stem:
+                    parts = Path(final_path).stem.rsplit('_', 1)
+                    if len(parts) == 2:
+                        lang_suffix = f" ({parts[1]})"
+                
+                dvd = create_dvd_entry(
+                    session,
+                    title=metadata.get('title', 'Unknown') + lang_suffix,
+                    original_title=metadata.get('original_title'),
+                    year=int(metadata['year']) if metadata.get('year') and str(metadata['year']).isdigit() else None,
+                    plot=metadata.get('plot'),
+                    poster_url=metadata.get('poster_url'),
+                    backdrop_url=metadata.get('backdrop_url'),
+                    genre=', '.join(metadata['genres']) if isinstance(metadata.get('genres'), list) else metadata.get('genre'),
+                    director=metadata.get('director'),
+                    cast=', '.join(metadata['cast']) if isinstance(metadata.get('cast'), list) else metadata.get('cast'),
+                    runtime=metadata.get('runtime'),
+                    imdb_id=metadata.get('imdb_id'),
+                    tmdb_id=int(metadata['tmdb_id']) if metadata.get('tmdb_id') and str(metadata['tmdb_id']).isdigit() else None,
+                    file_path=str(final_path),
+                    file_size=Path(final_path).stat().st_size,
+                    file_format=settings.formats.container,
+                    video_codec=settings.formats.video_codec,
+                    audio_codec=settings.formats.audio_codec,
+                    status='completed',
+                    resolution=None  # Could detect this
+                )
+                dvd_entries.append(dvd.id)
+            
+            # Update job with first DVD entry reference
             job = session.get(RipJob, job_id)
-            job.dvd_entry_id = dvd.id
+            if dvd_entries:
+                job.dvd_entry_id = dvd_entries[0]
             session.add(job)
             session.commit()
             
@@ -437,7 +472,7 @@ def process_dvd_task(
                 job_id,
                 status='completed',
                 progress_percent=100,
-                current_step='Complete'
+                current_step=f'Complete - {len(final_paths)} file(s) created'
             )
             
         # Step 8: Cleanup
@@ -449,8 +484,9 @@ def process_dvd_task(
         return {
             'status': 'completed',
             'job_id': job_id,
-            'file_path': str(final_path),
-            'file_size': file_size,
+            'file_paths': final_paths,
+            'file_count': len(final_paths),
+            'total_size': total_size,
             'metadata': metadata
         }
         
