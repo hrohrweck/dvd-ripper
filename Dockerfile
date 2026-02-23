@@ -21,6 +21,8 @@ RUN apt-get update && apt-get install -y \
     libdvdnav4 \
     libdvdread8 \
     libbluray2 \
+    lsdvd \
+    dvdbackup \
     # Device management
     udev \
     sg3-utils \
