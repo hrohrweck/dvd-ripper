@@ -58,9 +58,11 @@ class DVDRipper:
         
     def _create_temp_dir(self) -> Path:
         """Create temporary directory for processing."""
-        # Use tmpfs for faster I/O if available
-        temp_base = "/dev/shm" if Path("/dev/shm").exists() else None
+        # Use disk-based storage to avoid RAM limitations
+        # /tmp may be tmpfs on some systems, so use /var/tmp for guaranteed disk storage
+        temp_base = "/var/tmp" if Path("/var/tmp").exists() else "/tmp"
         self.temp_dir = Path(tempfile.mkdtemp(prefix="dvdrip_", dir=temp_base))
+        logger.info(f"Created temp directory: {self.temp_dir}")
         return self.temp_dir
         
     def cleanup(self):
@@ -439,10 +441,13 @@ class DVDRipper:
             if job_id:
                 job_manager.register_process(job_id, process)
             
-            # Monitor progress (dvdbackup doesn't have percentage, so we just wait)
-            for line in process.stdout:
-                line = line.strip()
-                logger.debug(f"dvdbackup: {line}")
+            # Monitor progress with timeout to avoid blocking forever
+            import select
+            while True:
+                # Check if process has finished
+                ret = process.poll()
+                if ret is not None:
+                    break
                 
                 # Check for cancellation
                 if job_id and check_job_cancellation(job_id):
@@ -453,10 +458,20 @@ class DVDRipper:
                         process.kill()
                     return RipResult(success=False, error_message="Job cancelled by user")
                 
-                if progress_callback:
-                    progress_callback("ripping", 50, line)  # Rough progress
-            
-            process.wait()
+                # Read available output (non-blocking)
+                readable, _, _ = select.select([process.stdout], [], [], 1.0)
+                if readable:
+                    try:
+                        line = process.stdout.readline()
+                        if line:
+                            line = line.strip()
+                            logger.debug(f"dvdbackup: {line}")
+                            if progress_callback:
+                                progress_callback("ripping", 50, line)
+                    except:
+                        pass
+                
+                time.sleep(0.1)
             
             # Check if process was cancelled after completion
             if job_id and check_job_cancellation(job_id):
