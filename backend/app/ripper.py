@@ -544,6 +544,7 @@ class DVDRipper:
                     "ffmpeg",
                     "-hide_banner",
                     "-y",
+                    "-fflags", "+genpts",  # Generate presentation timestamps for VOB files
                     "-f", "concat",
                     "-safe", "0",
                     "-i", str(concat_file),

@@ -119,12 +119,19 @@ def _save_to_archive_ssh(
         sftp = ssh.open_sftp()
         
         try:
-            # Create destination directory
+            # Create destination directory recursively
+            # Use mkdir -p via SSH to create all parent directories
+            stdin, stdout, stderr = ssh.exec_command(f'mkdir -p "{remote_dir}"')
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                error_msg = stderr.read().decode().strip()
+                raise RuntimeError(f"Failed to create remote directory {remote_dir}: {error_msg}")
+            
+            # Verify directory was created
             try:
-                sftp.mkdir(remote_dir)
+                sftp.stat(remote_dir)
             except IOError:
-                # Directory may already exist
-                pass
+                raise RuntimeError(f"Remote directory {remote_dir} was not created")
             
             # Check for duplicate files and find unique name
             counter = 1
