@@ -1,5 +1,6 @@
 """FastAPI application main entry point."""
 import os
+import shutil
 import subprocess
 import asyncio
 import logging
@@ -13,6 +14,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -299,6 +302,69 @@ async def get_dvd_details(
     }
 
 
+def _delete_archive_file(file_path: str, settings: Settings) -> bool:
+    """Delete an archive file from local disk or SSH destination.
+
+    Returns True if the file was deleted or did not exist, False on
+    unexpected failure. Errors are logged but not raised so that the
+    library entry can still be removed.
+    """
+    if not file_path:
+        return True
+
+    if settings.destination.type == "ssh":
+        try:
+            import paramiko
+            ssh_config = settings.destination.ssh
+            host = ssh_config.host
+            user = ssh_config.user
+            key_path = ssh_config.key_path
+
+            if not host or not user:
+                logger.warning("SSH destination not fully configured; skipping remote file deletion")
+                return True
+
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            connect_kwargs = {
+                "hostname": host,
+                "username": user,
+                "timeout": 30,
+            }
+            if key_path and Path(key_path).exists():
+                connect_kwargs["key_filename"] = key_path
+
+            client.connect(**connect_kwargs)
+            try:
+                sftp = client.open_sftp()
+                try:
+                    sftp.remove(file_path)
+                    logger.info(f"Deleted remote archive file: {file_path}")
+                except FileNotFoundError:
+                    logger.warning(f"Remote archive file already removed: {file_path}")
+                finally:
+                    sftp.close()
+            finally:
+                client.close()
+            return True
+        except Exception as e:
+            logger.warning(f"Could not delete remote archive file {file_path}: {e}")
+            return False
+
+    # Local destination
+    path = Path(file_path)
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+        logger.info(f"Deleted local archive file: {file_path}")
+        return True
+    except Exception as e:
+        logger.warning(f"Could not delete local archive file {file_path}: {e}")
+        return False
+
+
 @app.delete("/api/library/{dvd_id}")
 async def delete_dvd(
     dvd_id: int,
@@ -310,25 +376,25 @@ async def delete_dvd(
     dvd = get_dvd_by_id(session, dvd_id)
     if not dvd:
         raise HTTPException(status_code=404, detail="DVD not found")
-    
-    # Delete file if requested
+
+    # Delete the archive file if requested. Do not let a missing or
+    # inaccessible file block removal of the library entry.
     if delete_file and dvd.file_path:
-        try:
-            import os
-            os.remove(dvd.file_path)
-        except Exception as e:
-            raise HTTPException(
-                status_code=500, 
-                detail=f"Failed to delete file: {e}"
-            )
-    
+        settings = get_settings()
+        _delete_archive_file(dvd.file_path, settings)
+
+    # Unlink associated rip jobs so the foreign key never blocks deletion
+    # regardless of database configuration.
+    jobs = session.exec(select(RipJob).where(RipJob.dvd_entry_id == dvd_id)).all()
+    for job in jobs:
+        job.dvd_entry_id = None
+        session.add(job)
+
     session.delete(dvd)
     session.commit()
-    
+
     return {"status": "deleted"}
 
-
-# Job routes
 
 @app.get("/api/jobs")
 async def get_jobs(

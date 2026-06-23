@@ -31,7 +31,8 @@ function Library() {
       fetchMovies()
       setSelectedMovie(null)
     } catch (err) {
-      alert('Failed to delete')
+      const detail = err.response?.data?.detail || err.message
+      alert('Failed to delete: ' + detail)
     }
   }
 

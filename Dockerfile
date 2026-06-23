@@ -50,7 +50,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 
 # Build MakeMKV from source (bin and oss)
 # Note: Check https://www.makemkv.com/download/ for the latest version
-ARG MAKEMKV_VERSION=1.18.3
+ARG MAKEMKV_VERSION=1.18.4
 RUN mkdir -p /tmp/makemkv && cd /tmp/makemkv && \
     wget https://www.makemkv.com/download/makemkv-bin-${MAKEMKV_VERSION}.tar.gz && \
     wget https://www.makemkv.com/download/makemkv-oss-${MAKEMKV_VERSION}.tar.gz && \
