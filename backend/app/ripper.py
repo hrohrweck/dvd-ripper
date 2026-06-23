@@ -5,6 +5,7 @@ import tempfile
 import json
 import logging
 import time
+import fcntl
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
@@ -73,6 +74,36 @@ class DVDRipper:
                 logger.info(f"Cleaned up temp directory: {self.temp_dir}")
             except Exception as e:
                 logger.warning(f"Failed to cleanup temp directory: {e}")
+    
+    def _is_disc_present(self) -> bool:
+        """Check if a disc is present in the configured DVD drive."""
+        CDROM_DRIVE_STATUS = 0x5326
+        CDSL_CURRENT = 0x0002
+        CDS_DISC_OK = 4
+        
+        device = self.settings.dvd_device
+        
+        try:
+            if not os.path.exists(device):
+                logger.warning(f"DVD device {device} does not exist")
+                return False
+            
+            fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+            try:
+                status = fcntl.ioctl(fd, CDROM_DRIVE_STATUS, CDSL_CURRENT)
+                logger.debug(f"Drive status for {device}: {status}")
+                return status == CDS_DISC_OK
+            finally:
+                os.close(fd)
+        except PermissionError as e:
+            logger.error(f"Permission denied accessing {device}: {e}")
+            return False
+        except OSError as e:
+            logger.error(f"Failed to get drive status for {device}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error checking drive status: {e}")
+            return False
     
     def _check_tool(self, tool: str) -> bool:
         """Check if a tool is available."""
