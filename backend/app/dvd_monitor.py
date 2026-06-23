@@ -4,9 +4,10 @@ import fcntl
 import asyncio
 import subprocess
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict
 from dataclasses import dataclass
 import logging
+import ast
 
 # CDROM ioctl constants
 CDROM_DRIVE_STATUS = 0x5326
@@ -78,6 +79,48 @@ class DVDMonitor:
         is_present = status == CDS_DISC_OK
         logger.debug(f"Disc present check: status={status}, CDS_DISC_OK={CDS_DISC_OK}, is_present={is_present}")
         return is_present
+    
+    def _check_tool(self, tool: str) -> bool:
+        """Check if a system tool is available."""
+        result = subprocess.run(["which", tool], capture_output=True)
+        return result.returncode == 0
+    
+    def _get_disc_info_lsdvd(self) -> Optional[Dict]:
+        """Detect DVD-Video structure using lsdvd."""
+        if not self._check_tool("lsdvd"):
+            return None
+        
+        try:
+            logger.info(f"Running lsdvd to detect disc type for {self.device_path}")
+            result = subprocess.run(
+                ["lsdvd", "-x", "-Oy", self.device_path],
+                capture_output=True,
+                timeout=60
+            )
+            
+            if result.returncode != 0:
+                stderr = result.stderr.decode('utf-8', errors='replace')
+                logger.warning(f"lsdvd failed: {stderr}")
+                return None
+            
+            output = result.stdout.decode('utf-8', errors='replace')
+            if "lsdvd =" not in output:
+                return None
+            
+            # lsdvd -Oy outputs a Python-style dict
+            data_str = output.split("lsdvd =", 1)[1].strip()
+            data = ast.literal_eval(data_str)
+            
+            return {
+                "disc_name": data.get("title", "Unknown"),
+                "titles": data.get("track", []),
+            }
+        except subprocess.TimeoutExpired:
+            logger.warning("lsdvd timed out")
+            return None
+        except Exception as e:
+            logger.error(f"lsdvd detection failed: {e}")
+            return None
         
     def _mount_disc(self) -> Optional[str]:
         """Try to mount the disc and return mount point."""
@@ -191,17 +234,32 @@ class DVDMonitor:
         if not self._is_disc_present():
             logger.debug("No disc present")
             return None
-            
+        
+        # Prefer lsdvd: it works without mounting and handles most CSS discs
+        lsdvd_info = self._get_disc_info_lsdvd()
+        if lsdvd_info and lsdvd_info.get("titles"):
+            label = lsdvd_info.get("disc_name")
+            volume_size = self._get_disc_size()
+            logger.info(
+                f"lsdvd detected DVD-Video at {self.device_path}: "
+                f"label={label}, titles={len(lsdvd_info['titles'])}, volume_size={volume_size}"
+            )
+            return DiscInfo(
+                device=self.device_path,
+                label=label,
+                is_dvd_video=True,
+                volume_size=volume_size
+            )
+        
+        # Fallback to mount + VIDEO_TS / blkid detection
         mount_point = self._mount_disc()
         
         try:
-            # Try to detect if it's a DVD-Video disc
             is_dvd = False
             if mount_point:
                 is_dvd = self._is_dvd_video_disc(mount_point)
                 logger.debug(f"VIDEO_TS check result: {is_dvd}")
             
-            # Fallback: use blkid to detect UDF filesystem (DVD-Video uses UDF)
             if not is_dvd:
                 is_dvd = self._is_dvd_video_by_blkid()
                 logger.debug(f"blkid UDF check result: {is_dvd}")
