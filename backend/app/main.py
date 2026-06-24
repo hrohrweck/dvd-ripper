@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import asyncio
 import logging
+import mimetypes
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -17,7 +18,7 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Request, UploadFile, File, Header
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -149,6 +150,34 @@ async def require_auth(token: str = Depends(oauth2_scheme)) -> str:
             headers={"WWW-Authenticate": "Bearer"},
         )
     payload = verify_token(token)
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return payload.get("sub")
+
+
+async def require_auth_query_or_header(
+    token: Optional[str] = None,
+    authorization: Optional[str] = Header(None)
+) -> str:
+    """Require authentication from Bearer header or ?token= query parameter.
+
+    HTML5 video elements cannot send custom headers, so the stream endpoint
+    accepts the JWT as a query string token.
+    """
+    auth_token = token
+    if not auth_token and authorization and authorization.lower().startswith("bearer "):
+        auth_token = authorization[7:]
+    if not auth_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    payload = verify_token(auth_token)
     if payload is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -394,6 +423,66 @@ async def delete_dvd(
     session.commit()
 
     return {"status": "deleted"}
+
+
+def _guess_video_mime_type(file_path: Path) -> str:
+    """Guess MIME type for common video containers."""
+    ext = file_path.suffix.lower()
+    mapping = {
+        ".mp4": "video/mp4",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".m4v": "video/mp4",
+        ".ts": "video/mp2t",
+    }
+    return mapping.get(ext, "application/octet-stream")
+
+
+@app.get("/api/library/{dvd_id}/stream")
+async def stream_dvd(
+    dvd_id: int,
+    token: Optional[str] = None,
+    session: Session = Depends(get_session),
+    current_user: str = Depends(require_auth_query_or_header)
+):
+    """Stream the archived video file for a library entry."""
+    dvd = get_dvd_by_id(session, dvd_id)
+    if not dvd:
+        raise HTTPException(status_code=404, detail="DVD not found")
+    
+    if not dvd.file_path:
+        raise HTTPException(status_code=404, detail="No file path for this entry")
+    
+    settings = get_settings()
+    archive_base = Path(settings.destination.local.path).resolve()
+    file_path = Path(dvd.file_path).resolve()
+    
+    # Path traversal protection: the resolved file must be inside the archive
+    try:
+        file_path.relative_to(archive_base)
+    except ValueError:
+        logger.warning(f"Stream request attempted outside archive: {file_path}")
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    media_type = _guess_video_mime_type(file_path)
+    
+    def iterfile():
+        with open(file_path, "rb") as f:
+            yield from f
+    
+    return StreamingResponse(
+        iterfile(),
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{file_path.name}"',
+            "Accept-Ranges": "bytes",
+        }
+    )
 
 
 @app.get("/api/jobs")

@@ -6,6 +6,7 @@ function Library() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [selectedMovie, setSelectedMovie] = useState(null)
+  const [playingMovie, setPlayingMovie] = useState(null)
 
   useEffect(() => {
     fetchMovies()
@@ -21,6 +22,17 @@ function Library() {
     } finally {
       setLoading(false)
     }
+  }
+
+  const getStreamUrl = (id) => {
+    const token = localStorage.getItem('token') || ''
+    return `/api/library/${id}/stream?token=${encodeURIComponent(token)}`
+  }
+
+  const handlePlay = (e, movie) => {
+    e.stopPropagation()
+    setSelectedMovie(null)
+    setPlayingMovie(movie)
   }
 
   const handleDelete = async (id, deleteFile = false) => {
@@ -68,8 +80,8 @@ function Library() {
       ) : (
         <div className="movie-grid">
           {movies.map(movie => (
-            <div 
-              key={movie.id} 
+            <div
+              key={movie.id}
               className="movie-card"
               onClick={() => setSelectedMovie(movie)}
             >
@@ -79,6 +91,13 @@ function Library() {
                 ) : (
                   '📀'
                 )}
+                <button
+                  className="play-button"
+                  onClick={(e) => handlePlay(e, movie)}
+                  title="Play"
+                >
+                  ▶
+                </button>
               </div>
               <div className="movie-info">
                 <div className="movie-title">{movie.title}</div>
@@ -142,18 +161,53 @@ function Library() {
               </div>
             </div>
             <div className="modal-footer">
-              <button 
+              <button
+                className="btn btn-primary"
+                onClick={() => setPlayingMovie(selectedMovie)}
+              >
+                ▶ Play
+              </button>
+              <button
                 className="btn btn-secondary"
                 onClick={() => handleDelete(selectedMovie.id, false)}
               >
                 Remove Entry
               </button>
-              <button 
+              <button
                 className="btn btn-danger"
                 onClick={() => handleDelete(selectedMovie.id, true)}
               >
                 Delete File & Entry
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Video Player Overlay */}
+      {playingMovie && (
+        <div className="modal-overlay video-overlay" onClick={() => setPlayingMovie(null)}>
+          <div className="video-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="video-modal-header">
+              <h3>{playingMovie.title}</h3>
+              <button
+                className="btn btn-secondary"
+                onClick={() => setPlayingMovie(null)}
+              >
+                ✕
+              </button>
+            </div>
+            <div className="video-container">
+              <video
+                controls
+                autoPlay
+                src={getStreamUrl(playingMovie.id)}
+                onError={(e) => {
+                  console.error('Video playback error:', e)
+                  alert('Unable to play this video. The file may be missing, on a remote storage destination, or in an unsupported format.')
+                  setPlayingMovie(null)
+                }}
+              />
             </div>
           </div>
         </div>
