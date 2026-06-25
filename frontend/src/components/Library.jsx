@@ -514,9 +514,22 @@ function Library() {
                 controls
                 autoPlay
                 src={getStreamUrl(playingMovie.id)}
-                onError={(e) => {
+                onError={async (e) => {
                   console.error('Video playback error:', e)
-                  alert('Unable to play this video. The file may be missing, on a remote storage destination, or in an unsupported format.')
+                  const streamUrl = getStreamUrl(playingMovie.id)
+                  let detail = ''
+                  try {
+                    // Probe the stream to surface the real HTTP error
+                    await api.get(streamUrl, {
+                      responseType: 'blob',
+                      headers: { Range: 'bytes=0-0' }
+                    })
+                  } catch (err) {
+                    detail = err.response?.status
+                      ? ` (HTTP ${err.response.status}: ${err.response?.data?.detail || err.message})`
+                      : ` (${err.message})`
+                  }
+                  alert('Unable to play this video.' + detail + '\n\nThe file may be missing, on a remote storage destination, or in an unsupported format.')
                   setPlayingMovie(null)
                 }}
               />

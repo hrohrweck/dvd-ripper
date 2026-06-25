@@ -486,10 +486,14 @@ async def stream_dvd(
         raise HTTPException(status_code=403, detail="Access denied")
 
     if not file_path.exists() or not file_path.is_file():
+        logger.warning(f"Stream request file not found: {file_path}")
         raise HTTPException(status_code=404, detail="Video file not found")
 
     media_type = _guess_video_mime_type(file_path)
     file_size = file_path.stat().st_size
+    logger.info(
+        f"Streaming {file_path} ({file_size} bytes, {media_type}) to user {current_user}"
+    )
     range_tuple = _parse_range_header(request.headers.get("range"), file_size)
 
     if range_tuple:
@@ -507,6 +511,9 @@ async def stream_dvd(
                     remaining -= len(chunk)
                     yield chunk
 
+        logger.debug(
+            f"Stream range request for {file_path}: bytes {start}-{end}/{file_size}"
+        )
         return StreamingResponse(
             iter_range(),
             status_code=206,
@@ -515,7 +522,6 @@ async def stream_dvd(
                 "Content-Range": f"bytes {start}-{end}/{file_size}",
                 "Content-Length": str(length),
                 "Accept-Ranges": "bytes",
-                "Content-Disposition": f'inline; filename="{file_path.name}"',
             }
         )
 
@@ -527,6 +533,7 @@ async def stream_dvd(
                     break
                 yield chunk
 
+    logger.debug(f"Stream full request for {file_path}: {file_size} bytes")
     return StreamingResponse(
         iter_full(),
         status_code=200,
@@ -534,7 +541,6 @@ async def stream_dvd(
         headers={
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{file_path.name}"',
         }
     )
 
