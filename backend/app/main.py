@@ -22,6 +22,7 @@ from fastapi import FastAPI, Depends, HTTPException, status, BackgroundTasks, Re
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import selectinload
 from sqlmodel import Session, select
 from celery.result import AsyncResult
@@ -309,26 +310,7 @@ async def get_dvd_details(
     if not dvd:
         raise HTTPException(status_code=404, detail="DVD not found")
     
-    return {
-        "id": dvd.id,
-        "title": dvd.title,
-        "original_title": dvd.original_title,
-        "year": dvd.year,
-        "plot": dvd.plot,
-        "poster_url": dvd.poster_url,
-        "backdrop_url": dvd.backdrop_url,
-        "genre": dvd.genre,
-        "director": dvd.director,
-        "cast": dvd.cast.split(", ") if dvd.cast else [],
-        "runtime": dvd.runtime,
-        "imdb_id": dvd.imdb_id,
-        "file_path": dvd.file_path,
-        "file_size": dvd.file_size,
-        "file_format": dvd.file_format,
-        "resolution": dvd.resolution,
-        "status": dvd.status,
-        "created_at": dvd.created_at.isoformat() if dvd.created_at else None
-    }
+    return _dvd_entry_to_dict(dvd)
 
 
 def _delete_archive_file(file_path: str, settings: Settings) -> bool:
@@ -483,6 +465,170 @@ async def stream_dvd(
             "Accept-Ranges": "bytes",
         }
     )
+
+
+class DVDUpdate(BaseModel):
+    """Editable fields for a library entry."""
+    title: Optional[str] = None
+    original_title: Optional[str] = None
+    year: Optional[int] = None
+    plot: Optional[str] = None
+    poster_url: Optional[str] = None
+    backdrop_url: Optional[str] = None
+    genre: Optional[str] = None
+    director: Optional[str] = None
+    cast: Optional[List[str]] = None
+    runtime: Optional[int] = None
+    imdb_id: Optional[str] = None
+    tmdb_id: Optional[int] = None
+    video_codec: Optional[str] = None
+    audio_codec: Optional[str] = None
+    resolution: Optional[str] = None
+    status: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+def _dvd_entry_to_dict(dvd: DVDEntry) -> dict:
+    """Serialize a DVDEntry to the same shape used by the GET endpoints."""
+    return {
+        "id": dvd.id,
+        "title": dvd.title,
+        "original_title": dvd.original_title,
+        "year": dvd.year,
+        "plot": dvd.plot,
+        "poster_url": dvd.poster_url,
+        "backdrop_url": dvd.backdrop_url,
+        "genre": dvd.genre,
+        "director": dvd.director,
+        "cast": dvd.cast.split(", ") if dvd.cast else [],
+        "runtime": dvd.runtime,
+        "imdb_id": dvd.imdb_id,
+        "tmdb_id": dvd.tmdb_id,
+        "file_path": dvd.file_path,
+        "file_size": dvd.file_size,
+        "file_format": dvd.file_format,
+        "video_codec": dvd.video_codec,
+        "audio_codec": dvd.audio_codec,
+        "resolution": dvd.resolution,
+        "status": dvd.status,
+        "error_message": dvd.error_message,
+        "created_at": dvd.created_at.isoformat() if dvd.created_at else None
+    }
+
+
+@app.put("/api/library/{dvd_id}")
+async def update_dvd(
+    dvd_id: int,
+    update: DVDUpdate,
+    session: Session = Depends(get_session),
+    current_user: str = Depends(require_auth)
+):
+    """Update metadata for a library entry."""
+    dvd = get_dvd_by_id(session, dvd_id)
+    if not dvd:
+        raise HTTPException(status_code=404, detail="DVD not found")
+    
+    update_data = update.model_dump(exclude_unset=True)
+    
+    # Convert list fields to comma-separated strings for storage
+    if "cast" in update_data and isinstance(update_data["cast"], list):
+        update_data["cast"] = ", ".join(update_data["cast"])
+    if "genre" in update_data and isinstance(update_data["genre"], list):
+        update_data["genre"] = ", ".join(update_data["genre"])
+    
+    # Only allow known fields
+    allowed_fields = set(DVDUpdate.model_fields.keys())
+    for field, value in update_data.items():
+        if field in allowed_fields:
+            setattr(dvd, field, value)
+    
+    dvd.updated_at = datetime.utcnow()
+    session.add(dvd)
+    session.commit()
+    session.refresh(dvd)
+    
+    return _dvd_entry_to_dict(dvd)
+
+
+class RefetchRequest(BaseModel):
+    """Request body for refetching metadata from a provider."""
+    provider: str
+    item_id: str
+
+
+@app.post("/api/library/{dvd_id}/refetch-metadata")
+async def refetch_dvd_metadata(
+    dvd_id: int,
+    request: RefetchRequest,
+    session: Session = Depends(get_session),
+    current_user: str = Depends(require_auth)
+):
+    """Fetch metadata from an online provider and update the library entry."""
+    dvd = get_dvd_by_id(session, dvd_id)
+    if not dvd:
+        raise HTTPException(status_code=404, detail="DVD not found")
+    
+    settings = get_settings()
+    fetcher = MetadataFetcher(settings)
+    details = await fetcher.get_details(request.provider, request.item_id)
+    
+    if not details:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    
+    # Map provider result fields to DVDEntry columns
+    if details.get("title"):
+        dvd.title = details["title"]
+    if "original_title" in details:
+        dvd.original_title = details["original_title"]
+    if details.get("plot"):
+        dvd.plot = details["plot"]
+    if "poster_url" in details:
+        dvd.poster_url = details["poster_url"]
+    if "backdrop_url" in details:
+        dvd.backdrop_url = details["backdrop_url"]
+    if "director" in details:
+        dvd.director = details["director"]
+    if "runtime" in details:
+        dvd.runtime = details["runtime"]
+    if "imdb_id" in details:
+        dvd.imdb_id = details["imdb_id"]
+    
+    # Year may be a string from some providers
+    year = details.get("year")
+    if year is not None:
+        try:
+            dvd.year = int(year)
+        except (ValueError, TypeError):
+            pass
+    
+    # Genre / cast lists
+    genres = details.get("genres")
+    if isinstance(genres, list):
+        dvd.genre = ", ".join(genres)
+    elif "genre" in details:
+        dvd.genre = details["genre"]
+    
+    cast = details.get("cast")
+    if isinstance(cast, list):
+        dvd.cast = ", ".join(cast)
+    elif "cast" in details:
+        dvd.cast = cast
+    
+    # Provider-specific IDs
+    if request.provider == "tmdb":
+        try:
+            dvd.tmdb_id = int(details.get("id"))
+        except (ValueError, TypeError):
+            dvd.tmdb_id = None
+    elif request.provider == "omdb":
+        dvd.imdb_id = details.get("id")
+    
+    dvd.updated_at = datetime.utcnow()
+    session.add(dvd)
+    session.commit()
+    session.refresh(dvd)
+    
+    return _dvd_entry_to_dict(dvd)
 
 
 @app.get("/api/jobs")
