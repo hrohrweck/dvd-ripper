@@ -520,14 +520,15 @@ function Library() {
                   let detail = ''
                   try {
                     // Probe the stream to surface the real HTTP error
-                    await api.get(streamUrl, {
-                      responseType: 'blob',
-                      headers: { Range: 'bytes=0-0' }
+                    const probe = await api.get(streamUrl, {
+                      headers: { Range: 'bytes=0-0' },
+                      validateStatus: () => true
                     })
+                    if (probe.status >= 400) {
+                      detail = ` (HTTP ${probe.status}: ${probe.data?.detail || 'error'})`
+                    }
                   } catch (err) {
-                    detail = err.response?.status
-                      ? ` (HTTP ${err.response.status}: ${err.response?.data?.detail || err.message})`
-                      : ` (${err.message})`
+                    detail = ` (${err.message})`
                   }
                   alert('Unable to play this video.' + detail + '\n\nThe file may be missing, on a remote storage destination, or in an unsupported format.')
                   setPlayingMovie(null)
