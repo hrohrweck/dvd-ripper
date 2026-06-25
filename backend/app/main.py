@@ -422,47 +422,119 @@ def _guess_video_mime_type(file_path: Path) -> str:
     return mapping.get(ext, "application/octet-stream")
 
 
+def _parse_range_header(range_header: Optional[str], file_size: int) -> Optional[tuple[int, int]]:
+    """Parse a single 'bytes=start-end' range. Returns (start, end) or None."""
+    if not range_header or not range_header.lower().startswith("bytes="):
+        return None
+    range_spec = range_header[6:].strip()
+    if "," in range_spec:
+        # Multipart ranges are not supported for this endpoint
+        return None
+    try:
+        start_str, end_str = range_spec.split("-")
+        start = int(start_str) if start_str else None
+        end = int(end_str) if end_str else None
+    except ValueError:
+        return None
+
+    if start is None:
+        # Suffix range: last N bytes
+        suffix = end if end is not None else 0
+        start = max(0, file_size - suffix)
+        end = file_size - 1
+    else:
+        if end is None or end >= file_size:
+            end = file_size - 1
+        if start > end or start >= file_size:
+            return None
+
+    return start, end
+
+
+CHUNK_SIZE = 1024 * 1024  # 1 MB
+
+
 @app.get("/api/library/{dvd_id}/stream")
 async def stream_dvd(
     dvd_id: int,
+    request: Request,
     token: Optional[str] = None,
     session: Session = Depends(get_session),
     current_user: str = Depends(require_auth_query_or_header)
 ):
-    """Stream the archived video file for a library entry."""
+    """Stream the archived video file for a library entry.
+
+    Supports HTTP range requests so the browser can seek and buffer
+    efficiently without stuttering.
+    """
     dvd = get_dvd_by_id(session, dvd_id)
     if not dvd:
         raise HTTPException(status_code=404, detail="DVD not found")
-    
+
     if not dvd.file_path:
         raise HTTPException(status_code=404, detail="No file path for this entry")
-    
+
     settings = get_settings()
     archive_base = Path(settings.destination.local.path).resolve()
     file_path = Path(dvd.file_path).resolve()
-    
+
     # Path traversal protection: the resolved file must be inside the archive
     try:
         file_path.relative_to(archive_base)
     except ValueError:
         logger.warning(f"Stream request attempted outside archive: {file_path}")
         raise HTTPException(status_code=403, detail="Access denied")
-    
+
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Video file not found")
-    
+
     media_type = _guess_video_mime_type(file_path)
-    
-    def iterfile():
+    file_size = file_path.stat().st_size
+    range_tuple = _parse_range_header(request.headers.get("range"), file_size)
+
+    if range_tuple:
+        start, end = range_tuple
+        length = end - start + 1
+
+        def iter_range():
+            with open(file_path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(CHUNK_SIZE, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            iter_range(),
+            status_code=206,
+            media_type=media_type,
+            headers={
+                "Content-Range": f"bytes {start}-{end}/{file_size}",
+                "Content-Length": str(length),
+                "Accept-Ranges": "bytes",
+                "Content-Disposition": f'inline; filename="{file_path.name}"',
+            }
+        )
+
+    def iter_full():
         with open(file_path, "rb") as f:
-            yield from f
-    
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                yield chunk
+
     return StreamingResponse(
-        iterfile(),
+        iter_full(),
+        status_code=200,
         media_type=media_type,
         headers={
-            "Content-Disposition": f'inline; filename="{file_path.name}"',
+            "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{file_path.name}"',
         }
     )
 
