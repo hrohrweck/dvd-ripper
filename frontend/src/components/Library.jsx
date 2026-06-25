@@ -516,11 +516,12 @@ function Library() {
                 src={getStreamUrl(playingMovie.id)}
                 onError={async (e) => {
                   console.error('Video playback error:', e)
-                  const streamUrl = getStreamUrl(playingMovie.id)
+                  const token = localStorage.getItem('token') || ''
                   let detail = ''
                   try {
                     // Probe the stream to surface the real HTTP error
-                    const probe = await api.get(streamUrl, {
+                    const probe = await api.get(`/library/${playingMovie.id}/stream`, {
+                      params: { token },
                       headers: { Range: 'bytes=0-0' },
                       validateStatus: () => true
                     })
