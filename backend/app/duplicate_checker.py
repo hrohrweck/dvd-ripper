@@ -59,11 +59,23 @@ class DuplicateChecker:
                             break
             
             # Check 2: Check recent rip jobs with same disc label
+            # Treat queued or in-flight jobs as duplicates too, so a disc that
+            # is already waiting to be resumed/processed does not get ripped a
+            # second time if it is re-inserted.
             if disc_label and not matches:
                 cutoff = datetime.utcnow() - timedelta(days=30)
+                active_statuses = [
+                    "queued",
+                    "analyzing",
+                    "ripping",
+                    "transcoding",
+                    "fetching_metadata",
+                    "archiving",
+                    "completed",
+                ]
                 statement = select(RipJob).where(
                     RipJob.source_disc_title == disc_label,
-                    RipJob.status.in_(["completed", "ripping"]),
+                    RipJob.status.in_(active_statuses),
                     RipJob.started_at > cutoff
                 )
                 recent_jobs = session.exec(statement).all()

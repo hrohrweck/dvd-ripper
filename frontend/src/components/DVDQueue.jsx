@@ -47,6 +47,7 @@ function DVDQueue() {
   const getStatusBadge = (status) => {
     const statusMap = {
       'queued': 'info',
+      'resuming': 'warning',
       'ripping': 'warning',
       'transcoding': 'warning',
       'fetching_metadata': 'info',
@@ -116,9 +117,15 @@ function DVDQueue() {
                   <td>#{job.id}</td>
                   <td>{job.source_disc_title || 'Unknown'}</td>
                   <td>
-                    <span className={`badge badge-${getStatusBadge(job.status)}`}>
-                      {job.status}
-                    </span>
+                    {job.resumed && job.status === 'queued' ? (
+                      <span className={`badge badge-${getStatusBadge('resuming')}`}>
+                        resuming
+                      </span>
+                    ) : (
+                      <span className={`badge badge-${getStatusBadge(job.status)}`}>
+                        {job.status}
+                      </span>
+                    )}
                   </td>
                   <td>
                     {job.status === 'ripping' || job.status === 'transcoding' ? (

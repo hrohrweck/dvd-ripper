@@ -64,6 +64,10 @@ class RipJob(SQLModel, table=True):
     completed_at: Optional[datetime] = None
     error_message: Optional[str] = None
     
+    # Resume tracking
+    resumed: bool = False
+    resumed_at: Optional[datetime] = None
+    
     # Relationship
     dvd_entry: Optional[DVDEntry] = Relationship(back_populates="rip_jobs")
 

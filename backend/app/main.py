@@ -44,6 +44,7 @@ from app.tasks import process_dvd_task, celery_app
 from app.duplicate_checker import duplicate_checker
 from app.log_viewer import log_viewer
 from app.job_manager import job_manager
+from app.resume import resume_interrupted_jobs
 
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/token", auto_error=False)
@@ -54,14 +55,24 @@ async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     # Startup
     create_db_and_tables()
-    
+
+    # Resume any jobs that were interrupted by a server restart / OOM / reboot.
+    # This must run before the DVD monitor starts so that resumed jobs are
+    # already queued and are not incorrectly flagged as duplicates.
+    try:
+        resumed_count = resume_interrupted_jobs()
+        if resumed_count:
+            logger.info("Resumed %d interrupted job(s) on startup", resumed_count)
+    except Exception:
+        logger.exception("Failed to resume interrupted jobs; continuing startup")
+
     # Check first run
     if is_first_run():
         print("First run detected - admin setup required")
         os.environ["FIRST_RUN"] = "true"
     else:
         os.environ["FIRST_RUN"] = "false"
-    
+
     # Start DVD monitor in background
     settings = get_settings()
     monitor = create_monitor(settings.dvd_device)
@@ -738,7 +749,8 @@ async def get_jobs(
             "source_disc_title": j.source_disc_title,
             "started_at": j.started_at.isoformat() if j.started_at else None,
             "completed_at": j.completed_at.isoformat() if j.completed_at else None,
-            "error_message": j.error_message
+            "error_message": j.error_message,
+            "resumed": j.resumed
         }
         for j in jobs
     ]
@@ -775,6 +787,8 @@ async def get_job_details(
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "completed_at": job.completed_at.isoformat() if j.completed_at else None,
         "error_message": job.error_message,
+        "resumed": job.resumed,
+        "resumed_at": job.resumed_at.isoformat() if job.resumed_at else None,
         "celery_status": celery_status
     }
 

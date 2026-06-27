@@ -269,13 +269,14 @@ def process_dvd_task(
     self,
     device_path: str,
     disc_label: Optional[str] = None,
-    manual_metadata: Optional[dict] = None
+    manual_metadata: Optional[dict] = None,
+    existing_job_id: Optional[int] = None
 ):
     """
     Main DVD processing task.
     
     Workflow:
-    1. Create job record
+    1. Create or reuse job record
     2. Rip DVD
     3. Transcode
     4. Fetch metadata (if not provided)
@@ -287,19 +288,50 @@ def process_dvd_task(
     temp_output = None
     
     try:
-        # Step 1: Create job record
-        with get_session_context() as session:
-            job = create_rip_job(
-                session,
-                device_path=device_path,
-                source_disc_title=disc_label,
-                status="ripping",
-                current_step="Initializing..."
-            )
-            job_id = job.id
-            # Store job_id in request context (not kwargs to avoid retry issues)
-            self.request.job_id = job_id
-            
+        # Step 1: Create or reuse job record
+        if existing_job_id:
+            with get_session_context() as session:
+                job = session.get(RipJob, existing_job_id)
+                if job is None:
+                    logger.warning(
+                        "existing_job_id %d not found; creating a new job record",
+                        existing_job_id
+                    )
+                    job = create_rip_job(
+                        session,
+                        device_path=device_path,
+                        source_disc_title=disc_label,
+                        status="ripping",
+                        current_step="Initializing..."
+                    )
+                else:
+                    job.status = "ripping"
+                    job.progress_percent = 0
+                    job.current_step = "Initializing..."
+                    job.step_details = ""
+                    job.device_path = device_path
+                    job.source_disc_title = disc_label
+                    job.error_message = None
+                    job.completed_at = None
+                    job.resumed = True
+                    job.resumed_at = datetime.utcnow()
+                    session.add(job)
+                    session.commit()
+                    session.refresh(job)
+        else:
+            with get_session_context() as session:
+                job = create_rip_job(
+                    session,
+                    device_path=device_path,
+                    source_disc_title=disc_label,
+                    status="ripping",
+                    current_step="Initializing..."
+                )
+
+        job_id = job.id
+        # Store job_id in request context (not kwargs to avoid retry issues)
+        self.request.job_id = job_id
+
         # Update Celery task ID
         with get_session_context() as session:
             job = session.get(RipJob, job_id)
