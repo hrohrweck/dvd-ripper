@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 from sqlmodel import SQLModel, Field, Relationship, Session, create_engine, select
 from sqlalchemy.pool import StaticPool
+from sqlalchemy import inspect, text
 
 from app.config import get_settings
 
@@ -115,9 +116,38 @@ def get_engine():
 engine = get_engine()
 
 
+def _migrate_database():
+    """Add any columns that are missing from existing SQLite tables.
+
+    SQLModel's create_all() only creates missing tables; it does not alter
+    existing tables when the model changes. This lightweight migration
+    prevents 'no such column' errors after code updates.
+    """
+    try:
+        inspector = inspect(engine)
+        tables = inspector.get_table_names()
+
+        if "rip_jobs" in tables:
+            columns = {c["name"] for c in inspector.get_columns("rip_jobs")}
+            with engine.begin() as conn:
+                if "resumed" not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE rip_jobs ADD COLUMN resumed BOOLEAN DEFAULT 0"
+                    ))
+                if "resumed_at" not in columns:
+                    conn.execute(text(
+                        "ALTER TABLE rip_jobs ADD COLUMN resumed_at DATETIME"
+                    ))
+    except Exception as e:
+        # Don't let a migration problem prevent the app from starting.
+        import logging
+        logging.getLogger(__name__).warning(f"Database migration check failed: {e}")
+
+
 def create_db_and_tables():
-    """Create all database tables."""
+    """Create all database tables and migrate existing ones."""
     SQLModel.metadata.create_all(engine)
+    _migrate_database()
 
 
 def get_session() -> Generator[Session, None, None]:

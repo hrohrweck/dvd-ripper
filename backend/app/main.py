@@ -154,7 +154,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> Optional[str]
 
 
 async def require_auth(token: str = Depends(oauth2_scheme)) -> str:
-    """Require authentication."""
+    """Require authentication unless auth is disabled in settings."""
+    settings = get_settings()
+    if not settings.server.auth_enabled:
+        return "anonymous"
+
     if not token:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -178,8 +182,13 @@ async def require_auth_query_or_header(
     """Require authentication from Bearer header or ?token= query parameter.
 
     HTML5 video elements cannot send custom headers, so the stream endpoint
-    accepts the JWT as a query string token.
+    accepts the JWT as a query string token. Authentication is skipped when
+    auth is disabled in settings.
     """
+    settings = get_settings()
+    if not settings.server.auth_enabled:
+        return "anonymous"
+
     auth_token = token
     if not auth_token and authorization and authorization.lower().startswith("bearer "):
         auth_token = authorization[7:]
